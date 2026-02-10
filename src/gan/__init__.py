@@ -16,9 +16,16 @@ from src.gan.loss import (
 
 # ─────────────────────────────────── GAN factory ───────────────────────────────────
 def construct_gan(config, img_size, device):
-    use_batch_norm = config["loss"]["name"] != "wgan-gp"
-    is_critic      = config["loss"]["name"] == "wgan-gp"
+    loss_name = config["loss"]["name"].lower()
+
+    # critic-like outputs (no sigmoid) for WGAN-GP and hinge losses
+    is_critic = loss_name in {"wgan-gp", "hinge-r1", "ns"}
+
+    
+    use_batch_norm = loss_name != "wgan-gp"
+
     arch = config["architecture"]
+
 
     if arch["name"] == "dcgan":
         G = DC_G(img_size, z_dim=config["z_dim"],
@@ -49,40 +56,57 @@ def construct_gan(config, img_size, device):
                  is_critic=is_critic).to(device)
 
     elif arch["name"] == "chest-xray":
-        G = CXR_G(img_size, z_dim=config["z_dim"],
-                  filter_dim=arch["g_filter_dim"],
-                  n_blocks=arch["g_num_blocks"]).to(device)
-        D = CXR_D(img_size,
-                  filter_dim=arch["d_filter_dim"],
-                  n_blocks=arch["d_num_blocks"],
-                  use_batch_norm=use_batch_norm,
-                  is_critic=is_critic).to(device)
+        # chest_xray architecture expects `fmap` (not `filter_dim`)
+        G = CXR_G(
+            img_size=img_size,
+            z_dim=config["z_dim"],
+            fmap=arch["g_filter_dim"],
+        ).to(device)
+        D = CXR_D(
+            img_size=img_size,
+            fmap=arch["d_filter_dim"],
+            is_critic=is_critic,
+        ).to(device)
 
     elif arch["name"] == "stl10_sagan":
-        G = SA_G(img_size=img_size, z_dim=config["z_dim"],
-                 filter_dim=arch["g_filter_dim"],
-                 n_blocks=arch["g_num_blocks"]).to(device)
-        D = SA_D(img_size=img_size,
-                 filter_dim=arch["d_filter_dim"],
-                 n_blocks=arch["d_num_blocks"],
-                 is_critic=is_critic).to(device)
+        # stl10_sagan expects `fmap` and supports configurable `n_blocks`
+        G = SA_G(
+            img_size=img_size,
+            z_dim=config["z_dim"],
+            fmap=arch["g_filter_dim"],
+            n_blocks=arch["g_num_blocks"],
+        ).to(device)
+        D = SA_D(
+            img_size=img_size,
+            fmap=arch["d_filter_dim"],
+            n_blocks=arch["d_num_blocks"],
+            is_critic=is_critic,
+        ).to(device)
 
     elif arch["name"] == "cifar10_sagan":
-        G = CF_G(img_size = img_size, z_dim=config["z_dim"],
-                 filter_dim=arch["g_filter_dim"],
-                 n_blocks=arch["g_num_blocks"]).to(device)
-        D = CF_D(img_size,
-                 filter_dim=arch["d_filter_dim"],
-                 n_blocks=arch["d_num_blocks"],
-                 is_critic=is_critic).to(device)
+        # cifar10_sagan currently has fixed depth (3 generator/discriminator blocks)
+        if arch["g_num_blocks"] != 3 or arch["d_num_blocks"] != 3:
+            raise ValueError(
+                "cifar10_sagan uses a fixed-depth architecture. "
+                "Set g_num_blocks=3 and d_num_blocks=3."
+            )
+        G = CF_G(
+            img_size=img_size,
+            z_dim=config["z_dim"],
+            fmap=arch["g_filter_dim"],
+        ).to(device)
+        D = CF_D(
+            img_size=img_size,
+            fmap=arch["d_filter_dim"],
+            is_critic=is_critic,
+        ).to(device)
 
     elif arch["name"] == "imagenet":
-        G = Imagenet_G(img_size, z_dim=config["z_dim"],
-                       filter_dim=arch["g_filter_dim"]).to(device)
-        D = Imagenet_D(img_size,
-                       filter_dim=arch["d_filter_dim"],
-                       use_batch_norm=use_batch_norm,
-                       is_critic=is_critic).to(device)
+        raise NotImplementedError(
+            "imagenet architecture is class-conditional (requires labels in G/D forward), "
+            "but the current training loop is unconditional. "
+            "Use a non-imagenet architecture or implement conditional GAN training first."
+        )
 
     else:
         raise ValueError(f"Unsupported architecture: {arch['name']}")
@@ -94,7 +118,7 @@ def construct_loss(config, D):
     name = config["name"].lower()
 
     if name == "ns":
-        return NS_GeneratorLoss(), NS_DiscriminatorLoss()
+        return NS_GeneratorLoss(D), NS_DiscriminatorLoss(D)
 
     elif name == "wgan-gp":
         λ = config["args"]["lambda"]
