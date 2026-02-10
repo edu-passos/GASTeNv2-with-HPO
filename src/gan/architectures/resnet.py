@@ -125,6 +125,7 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         self.image_size = image_size
         self.df_dim = df_dim
+        self.is_critic = bool(is_critic)
 
         n_channels = image_size[0]
 
@@ -145,7 +146,7 @@ class Discriminator(nn.Module):
             nn.Linear(df_dim, 1)
         )
 
-        if not is_critic:
+        if not self.is_critic:
             self.predict.append(nn.Sigmoid())
 
     def forward(self, x):

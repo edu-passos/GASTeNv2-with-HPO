@@ -121,6 +121,7 @@ class Discriminator(nn.Module):
                  is_critic: bool = False,
                  **_):
         super().__init__()
+        self.is_critic = bool(is_critic)
         c,h,_ = img_size
         max_b = max(int(math.log2(h))//2, 1)
         self.n_blocks = min(n_blocks, max_b)
@@ -133,7 +134,7 @@ class Discriminator(nn.Module):
             in_ch = out_ch
         self.features = nn.Sequential(*layers)
         self.final_fc = spectral_norm(nn.Linear(in_ch*res*res, 1))
-        self.out_act  = nn.Identity() if is_critic else nn.Sigmoid()
+        self.out_act  = nn.Identity() if self.is_critic else nn.Sigmoid()
         self.apply(he)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

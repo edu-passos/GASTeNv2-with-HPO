@@ -134,6 +134,7 @@ class Discriminator(nn.Module):
         self.image_size = image_size
         self.filter_dim = filter_dim
         self.n_blocks = n_blocks
+        self.is_critic = bool(is_critic)
 
         n_channels, cur_s_h, cur_s_w = image_size
 
@@ -168,7 +169,7 @@ class Discriminator(nn.Module):
             # (b, 1)
         )
 
-        if not is_critic:
+        if not self.is_critic:
             self.predict.append(nn.Sigmoid())
 
         self.apply(weights_init)

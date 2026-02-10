@@ -105,6 +105,7 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, image_size, num_classes, base_ch=64, use_bn=False, is_critic=True):
         super().__init__()
+        self.is_critic = bool(is_critic)
         _, H, W = image_size
         dims = [base_ch * (2**i) for i in range(5)]
         blocks = []
@@ -127,7 +128,7 @@ class Discriminator(nn.Module):
         self.flatten    = nn.Flatten()
 
         self.embed = nn.Embedding(num_classes, dims[-1])
-        self.sigmoid = nn.Identity()
+        self.out_act = nn.Identity() if self.is_critic else nn.Sigmoid()
 
         self.apply(weights_init)
 
@@ -141,4 +142,4 @@ class Discriminator(nn.Module):
         emb = self.embed(labels)
         proj = torch.sum(flat * emb, dim=1, keepdim=True)
         out  = logit_uncond + proj
-        return self.sigmoid(out).view(-1)
+        return self.out_act(out).view(-1)

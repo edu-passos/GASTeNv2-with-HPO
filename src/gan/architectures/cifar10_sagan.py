@@ -122,8 +122,10 @@ class Discriminator(nn.Module):
     def __init__(self,
                  img_size: tuple[int, int, int] = (3, 32, 32),
                  fmap: int = 128,
+                 is_critic: bool = False,
                  **_):
         super().__init__()
+        self.is_critic = bool(is_critic)
         c, h, _ = img_size
         assert h == 32
         blocks = [spectral_norm(nn.Conv2d(c, fmap, 3, 1, 1))]
@@ -137,12 +139,13 @@ class Discriminator(nn.Module):
         self.final_conv  = spectral_norm(nn.Conv2d(fmap*8 + 1, fmap*8, 3, 1, 1))
         self.final_dense = spectral_norm(nn.Linear(fmap*8 * 4 * 4, 1))
         self.act = nn.LeakyReLU(.2)
+        self.out_act = nn.Identity() if self.is_critic else nn.Sigmoid()
         self.apply(he)
 
     def forward(self, x):
         x = self.blocks(x)
         x = self.act(self.final_conv(x))
-        return self.final_dense(x.flatten(1)).view(-1)
+        return self.out_act(self.final_dense(x.flatten(1))).view(-1)
 
 # ────────────────────────── builders ──────────────────────
 def build_cifar10_g(z_dim: int = 128, base_ch: int = 128):
