@@ -1,101 +1,85 @@
-import itertools
+import os
 import subprocess
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-import os
-from tqdm import tqdm
-from torch.utils.data import TensorDataset, DataLoader
-import json
-import torch
+from dotenv import load_dotenv
 
 from src.utils import create_and_store_z, gen_seed, set_seed
-from dotenv import load_dotenv
-from src.utils.config import read_config_clustering, read_config
-from src.clustering.generate_embeddings import load_gasten
-load_dotenv()
-
-parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-parser.add_argument('--data-dir', dest='dataroot',
-                    default=f"{os.environ['FILESDIR']}/data", help='Dir with dataset')
-parser.add_argument('--out-dir-models', dest='out_dir_models',
-                    default=f"{os.environ['FILESDIR']}/models", help='Path to generated models')
-parser.add_argument('--out-dir-data', dest='out_dir_data',
-                    default=f"{os.environ['FILESDIR']}/data/z", help='Path to generated noise data')
-parser.add_argument('--dataset', dest='dataset',
-                    default='mnist', help='Dataset (mnist or fashion-mnist or cifar10)')
-parser.add_argument('--n-classes', dest='n_classes',
-                    default=10, help='Number of classes in dataset')
-parser.add_argument('--device', type=str, default='cuda:0',
-                    help='Device to use. E.g. cuda, cuda:0 or cpu')
-parser.add_argument('--batch-size', dest='batch_size',
-                    type=int, default=64, help='Batch size')
-parser.add_argument('--lr', type=float, default=1e-3,
-                    help='ADAM opt learning rate')
-
-parser.add_argument('--pos', dest='pos_class', default=9,
-                    type=int, help='Positive class for binary classification')
-parser.add_argument('--neg', dest='neg_class', default=4,
-                    type=int, help='Negative class for binary classification')
-parser.add_argument('--epochs', type=str, default="1",
-                    help='Comma-separated list of epochs to train for')
-parser.add_argument('--classifier-type', dest='clf_type',
-                    type=str, help='List with elements "cnn" or "mlp"', default='cnn')
-parser.add_argument('--nf', type=str, default="1,2,4,8",
-                    help='Comma-separated list of possible num features')
-parser.add_argument("--nz", dest="nz", default=2000, type=int)
-parser.add_argument("--z-dim", dest="z_dim", default=64, type=int)
-parser.add_argument("--config", dest="config_path_optim", required=True, help="Config file for optimization")
-parser.add_argument("--config_clustering", dest="config_path_clustering", required=True, help="Config file for clustering")
-parser.add_argument("--seed", type=int, default=None)
+from src.utils.config import read_config
 
 
-def save(config, images, name):
-    print("> Save ...")
-    path = os.path.join(config['out-dir'], 'images')
-    torch.save(images, f"{path}/images_{name}.pt")
+def parse_args():
+    p = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    p.add_argument("--config", dest="config_path", required=True, help="YAML experiment config")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--trials", type=int, default=None)
+    p.add_argument("--walltime", type=int, default=None)
+    p.add_argument("--step2-trials", type=int, default=None)
+    p.add_argument("--step2-walltime", type=int, default=None)
+
+    # used only if we need to create z-pool
+    p.add_argument("--nz", type=int, default=2048)
+    p.add_argument("--z-dim", dest="z_dim", type=int, default=64)
+    return p.parse_args()
+
+
+def _ensure_test_noise(cfg: dict, seed: int, nz: int, z_dim: int) -> None:
+    """
+    Ensures cfg['test-noise'] exists. If it does not, create it in-place.
+    """
+    z_path = cfg.get("test-noise")
+    if not isinstance(z_path, str):
+        raise ValueError("Config must define 'test-noise' as a path string")
+
+    # We treat 'test-noise' as a directory produced by create_and_store_z
+    if os.path.exists(z_path):
+        return
+
+    parent = os.path.dirname(z_path)
+    os.makedirs(parent, exist_ok=True)
+
+    # create_and_store_z takes output directory and will create z_{nz}_{z_dim} under it,
+    # so we pass parent, then require that it matches our desired leaf name.
+    leaf = os.path.basename(z_path)
+    expected_leaf = f"z_{nz}_{z_dim}"
+    if leaf != expected_leaf:
+        raise ValueError(
+            f"'test-noise' is '{z_path}', but if we auto-create we expect leaf '{expected_leaf}'. "
+            "Either pre-create the noise pool, or set test-noise accordingly."
+        )
+
+    print(f"Creating test noise pool at {z_path} (seed={seed}, nz={nz}, z_dim={z_dim})")
+    create_and_store_z(parent, nz, z_dim, config={"seed": seed, "n_z": nz, "z_dim": z_dim})
+    if not os.path.exists(z_path):
+        raise RuntimeError(f"Failed to create test-noise directory at {z_path}")
 
 
 def main():
-    args = parser.parse_args()
+    load_dotenv()
+    args = parse_args()
 
     seed = gen_seed() if args.seed is None else args.seed
     set_seed(seed)
 
-    l_epochs = sorted(list(set([e for e in args.epochs.split(",") if e.isdigit()])), key=int)
-    l_clf_type = sorted(list(set([ct for ct in args.clf_type.split(",")])))
+    cfg = read_config(args.config_path)
+    _ensure_test_noise(cfg, seed=seed, nz=args.nz, z_dim=args.z_dim)
 
-    fixed_classifier_path = f"{os.environ['FILESDIR']}/models/{args.dataset}.5v{args.neg_class}v{args.pos_class}/my_fixed_classifier.pth"
-    print("Using fixed classifier:", fixed_classifier_path)
+    cmd1 = ["python3", "-m", "src.optimization.gasten_bayesian_optimization_step1", "--config", args.config_path]
+    if args.trials is not None:
+        cmd1 += ["--trials", str(args.trials)]
+    if args.walltime is not None:
+        cmd1 += ["--walltime", str(args.walltime)]
 
-    pos_class = str(args.pos_class)
-    neg_class = str(args.neg_class)
+    print("\nRunning:", " ".join(cmd1))
+    subprocess.run(cmd1, check=True)
 
-    fid_stats_path = f"{os.environ['FILESDIR']}/data/fid-stats/stats.inception.{args.dataset}.{pos_class}v{neg_class}.npz"
-    if not os.path.exists(fid_stats_path):
-        print(f"\nGenerating FID score for {pos_class}v{neg_class} ...")
-        subprocess.run(['python3', '-m', 'src.metrics.fid',
-                        '--data', args.dataroot,
-                        '--dataset', args.dataset,
-                        '--device', args.device,
-                        '--pos', pos_class, '--neg', neg_class])
-
-
-    if not os.path.exists(f"{os.environ['FILESDIR']}/data/z/z_{args.nz}_{args.z_dim}"):
-        create_and_store_z(
-            args.out_dir_data, args.nz, args.z_dim,
-            config={'seed': seed, 'n_z': args.nz, 'z_dim': args.z_dim})
-
-    # Run Step1 optimization (for the GAN only)
-    subprocess.run(['python3', '-m', 'src.optimization.gasten_multifidelity_optimization_step1',
-                    '--config', args.config_path_optim, '--pos', pos_class, '--neg', neg_class,
-                    '--dataset', args.dataset, '--fid-stats', fid_stats_path])
+    cmd2 = ["python3", "-m", "src.optimization.gasten_bayesian_optimization_step2", "--config", args.config_path]
+    if args.step2_trials is not None:
+        cmd2 += ["--trials", str(args.step2_trials)]
+    if args.step2_walltime is not None:
+        cmd2 += ["--walltime", str(args.step2_walltime)]
+    print("\nRunning:", " ".join(cmd2))
+    subprocess.run(cmd2, check=True)
 
 
-    classifier_paths = fixed_classifier_path
-
-    subprocess.run(['python3', '-m', 'src.optimization.gasten_multifidelity_optimization_step2',
-                    '--config', args.config_path_optim, '--classifiers', classifier_paths, '--pos', pos_class,
-                    '--neg', neg_class, '--dataset', args.dataset, '--fid-stats', fid_stats_path])
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

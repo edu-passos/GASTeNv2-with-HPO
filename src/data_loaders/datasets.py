@@ -53,9 +53,9 @@ def get_chest_xray(root, train=True):
     )
 
     tfm = T.Compose([
-        T.Lambda(lambda im: im.convert("RGB")),
+        T.Lambda(lambda im: im.convert("L")),   # <-- 1-channel grayscale
         T.Resize((128, 128)),
-        _norm((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        _norm((0.5,), (0.5,))                  # <-- 1-channel norm to [-1,1]
     ])
 
     class CXR(Dataset):

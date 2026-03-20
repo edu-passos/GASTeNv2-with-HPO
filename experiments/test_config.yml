@@ -2,7 +2,7 @@ project: gasten_20230413
 name: mnist-5v3_test
 out-dir: out
 data-dir: data
-test-noise: data/z\z_2048_64
+test-noise: data/z/z_2048_64
 fixed-noise: 200
 
 device: cuda:0
@@ -27,27 +27,29 @@ model:
     g_num_blocks: 3
     d_num_blocks: 3
   loss:
-    name: ns
+    name: wgan-gp
+    args:
+      lambda: 10.0
 
 optimizer:
-  lr: 0.0002
-  beta1: 0.5
-  beta2: 0.999
+  lr: 0.0001
+  beta1: 0.0
+  beta2: 0.9
 
 train:
   step-1:
-    epochs: 10
-    checkpoint-every: 1
-    disc-iters: 1
-    batch-size: 64
+    epochs: 80
+    checkpoint-every: 5
+    disc-iters: 5
+    batch-size: 128
 
   step-2:
-    epochs: 40
-    checkpoint-every: 10
+    epochs: 30
+    checkpoint-every: 5
     step-1-epochs:
       - best
-    batch-size: 64
-    disc-iters: 1
+    batch-size: 128
+    disc-iters: 3
     classifier:
       - models/mnist.5v3/cnn-4-50.4441
     weight:

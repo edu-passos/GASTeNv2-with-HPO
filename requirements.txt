@@ -1,21 +1,46 @@
-﻿# core numerics
-numpy
-scipy
+﻿# -------------------------
+# Core scientific stack
+# -------------------------
+numpy>=1.26,<3
+scipy>=1.11,<2
+pandas>=2.2,<3
+pyyaml>=6.0
+python-dotenv>=1.0.1
+schema>=0.7.5,<1
+tqdm>=4.66
+matplotlib>=3.8
+Pillow>=10.3
+scikit-learn>=1.4,<2
 
-# deep-learning stack
-torch
-torchvision
-timm
+# -------------------------
+# Vision / models
+# (leave torch/torchvision unpinned here because CUDA wheels vary by machine)
+# -------------------------
+torch>=2.2
+torchvision>=0.17
+timm>=0.9.16
+einops>=0.7
 
-# data handling / ML infrastructure
-datasets
-ConfigSpace
-smac
+# -------------------------
+# Hugging Face datasets (PINNED to avoid "Dataset scripts are no longer supported")
+# -------------------------
+datasets==3.6.0
+huggingface_hub<0.26
+pyarrow>=14,<18
 
-# experiment management & utilities
-wandb
-python-dotenv
-matplotlib
-schema
-seaborn
-captum
+# -------------------------
+# Experiment tracking
+# -------------------------
+wandb>=0.17
+
+# -------------------------
+# HPO (SMAC)
+# -------------------------
+smac>=2.2
+ConfigSpace>=1.2
+
+# -------------------------
+# xAI / clustering utilities (used in your Step-2 xAI pipeline)
+# -------------------------
+captum>=0.7
+umap-learn>=0.5.6

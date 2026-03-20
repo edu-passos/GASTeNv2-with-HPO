@@ -138,6 +138,8 @@ dmypy.json
 data/
 out/
 files/
+large_files/
+slurm/
 
 # Env variables
 .env

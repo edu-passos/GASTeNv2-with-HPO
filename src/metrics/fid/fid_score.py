@@ -90,11 +90,6 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     sigma1_reg = sigma1 + offset
     sigma2_reg = sigma2 + offset
 
-    # Check for collapse: if sigma1 is near zero, it may indicate collapse.
-    if np.linalg.norm(sigma1) < eps:
-        print("Warning: sigma1 is nearly zero. Model collapse suspected. Returning high FID.")
-        return np.inf
-
     covmean, _ = linalg.sqrtm(sigma1_reg.dot(sigma2_reg), disp=False)
     if not np.isfinite(covmean).all():
         msg = f"FID calculation produces singular product; adding eps={eps} to diagonal of cov estimates"

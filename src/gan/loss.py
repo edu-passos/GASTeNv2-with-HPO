@@ -30,20 +30,27 @@ class DiscriminatorLoss:
 
 
 class NS_DiscriminatorLoss(DiscriminatorLoss):
-    def __init__(self):
+    def __init__(self, D):
         super().__init__([])
+        self.D = D
         self.bce_logits = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCELoss()
 
     def __call__(self, real_data, fake_data, real_output, fake_output, device):
         ones  = torch.ones_like(real_output, dtype=torch.float, device=device)
         zeros = torch.zeros_like(fake_output, dtype=torch.float, device=device)
 
-        real_loss = self.bce_logits(real_output, ones)
-        fake_loss = self.bce_logits(fake_output, zeros)
+        if getattr(self.D, "is_critic", False):
+            real_loss = self.bce_logits(real_output, ones)
+            fake_loss = self.bce_logits(fake_output, zeros)
+        else:
+            real_loss = self.bce(real_output, ones)
+            fake_loss = self.bce(fake_output, zeros)
+
         return real_loss + fake_loss, {}
 
 
-class W_DiscrimatorLoss(DiscriminatorLoss):
+class  W_DiscriminatorLoss(DiscriminatorLoss):
     # (unused in our current construct_loss — we use WGP instead)
     def __init__(self):
         super().__init__([])
@@ -142,13 +149,17 @@ class GeneratorLoss:
 
 
 class NS_GeneratorLoss(GeneratorLoss):
-    def __init__(self):
+    def __init__(self, D):
         super().__init__([])
+        self.D = D
         self.bce_logits = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCELoss()
 
     def __call__(self, device, output):
         ones = torch.ones_like(output, dtype=torch.float, device=device)
-        return self.bce_logits(output, ones)
+        if getattr(self.D, "is_critic", False):
+            return self.bce_logits(output, ones)
+        return self.bce(output, ones)
 
 
 class W_GeneratorLoss(GeneratorLoss):

@@ -47,6 +47,9 @@ def evaluate(
 
         with torch.no_grad():
             gen_batch = G(z_batch.to(device))
+        # quick collapse diagnostics
+        print("gen_batch std:", gen_batch.float().std().item(), "min/max:", gen_batch.min().item(), gen_batch.max().item())
+
 
         if rgb_repeat and gen_batch.shape[1] == 1:
             gen_batch = gen_batch.repeat_interleave(3, dim=1)
@@ -193,8 +196,14 @@ def train(
     img0 = group_images(first_fake, classifier, device)
     if checkpoint_dir is not None:
         checkpoint_image(img0, 0, checkpoint_dir)
-        checkpoint_gan(G, D, g_opt, d_opt, {}, {}, config,
-                       epoch=0, output_dir=checkpoint_dir)
+        checkpoint_gan(
+            G, D, g_opt, d_opt,
+            state={},
+            stats={},
+            config=config,
+            output_dir=checkpoint_dir,
+            epoch=0,
+        )
 
     # -------- training loop ---------------------------------------
     iters_per_epoch = (len(loader) // n_disc_iters) * n_disc_iters
@@ -206,21 +215,20 @@ def train(
 
         for i in range(1, iters_per_epoch + 1):
             real, _ = next(it_loader)
-            train_disc(
-                G, D, d_opt, d_crit, real, batch_size, tr_log, device
-            )
+            train_disc(G, D, d_opt, d_crit, real, batch_size, tr_log, device)
 
             if i % n_disc_iters == 0:
                 g_it += 1
-                train_gen(g_updater, G, D, g_opt,
-                          batch_size, tr_log, device)
+                train_gen(g_updater, G, D, g_opt, batch_size, tr_log, device)
 
                 if g_it % log_every_g == 0 or g_it == iters_per_epoch // n_disc_iters:
                     try:
                         g_last = tr_log.last('G_loss')
                         d_last = tr_log.last('D_loss')
-                        print(f"[{epoch}/{n_epochs}] g_it {g_it}/{iters_per_epoch//n_disc_iters} "
-                              f"G {g_last:.3f} | D {d_last:.3f}")
+                        print(
+                            f"[{epoch}/{n_epochs}] g_it {g_it}/{iters_per_epoch//n_disc_iters} "
+                            f"G {g_last:.3f} | D {d_last:.3f}"
+                        )
                     except RuntimeError:
                         pass
 
@@ -235,14 +243,18 @@ def train(
             checkpoint_image(img, epoch, checkpoint_dir)
 
         tr_log.finalize_epoch()
-        evaluate(G, fid_metrics, ev_log,
-                 batch_size, test_noise, device, c_out_hist)
+        evaluate(G, fid_metrics, ev_log, batch_size, test_noise, device, c_out_hist)
         ev_log.finalize_epoch()
 
         if checkpoint_dir and (epoch % checkpoint_every == 0 or epoch == n_epochs):
-            checkpoint_gan(G, D, g_opt, d_opt, None,
-                           {"eval": ev_log.stats, "train": tr_log.stats},
-                           config, epoch, checkpoint_dir)
+            checkpoint_gan(
+                G, D, g_opt, d_opt,
+                state=None,
+                stats={"eval": ev_log.stats, "train": tr_log.stats},
+                config=config,
+                output_dir=checkpoint_dir,
+                epoch=epoch,
+            )
 
 
     metrics = {"train": tr_log.stats, "eval": ev_log.stats}
@@ -256,6 +268,4 @@ def train(
 
 __all__ = ["train_disc", "train_gen", "evaluate"]
 
-globals().update(
-    {name: globals()[name] for name in __all__}
-)
+globals().update({name: globals()[name] for name in __all__})

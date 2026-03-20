@@ -32,10 +32,13 @@ def load_dataset(name, data_dir, pos_class=None, neg_class=None, train=True):
 
     # Try to get targets from the dataset.
     if hasattr(dataset, "targets"):
-        targets = dataset.targets if torch.is_tensor(dataset.targets) else torch.Tensor(dataset.targets)
-        num_classes = targets.unique().size(0)
+        targets = dataset.targets
+        targets = targets if torch.is_tensor(targets) else torch.as_tensor(targets)
+        targets = targets.view(-1).to(torch.long)
+        num_classes = int(targets.unique().numel())
     else:
         num_classes = None
+
 
     if pos_class is not None and neg_class is not None:
         num_classes = 2

@@ -27,26 +27,30 @@ model:
     g_num_blocks: 3
     d_num_blocks: 3
   loss:
-    name: ns
+    name: wgan-gp
+    args:
+      lambda: 10.0
 
 optimizer:
-  lr: 0.0002
-  beta1: 0.5
-  beta2: 0.999
+  lr: 0.0001
+  beta1: 0.0
+  beta2: 0.9
 
 train:
   step-1:
-    epochs: 10
-    checkpoint-every: 1
-    disc-iters: 1
-    batch-size: 64
+    epochs: 80
+    checkpoint-every: 5
+    disc-iters: 5
+    batch-size: 128
 
   step-2:
-    epochs: 40
-    checkpoint-every: 10
-    batch-size: 64
-    disc-iters: 1
-    classifier: ["models/fashion-mnist/7v1/cnn-12-12.4441"]
+    epochs: 30
+    checkpoint-every: 5
+    step-1-epochs:
+      - best
+    batch-size: 128
+    disc-iters: 3
+    classifier: ["models/fashion-mnist/5v3/cnn-12-12.4441"]
     weight:
       - gaussian:
           alpha: 1.0

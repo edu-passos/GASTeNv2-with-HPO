@@ -126,14 +126,28 @@ config_schema = Schema({
 })
 
 def read_config(path):
+    def resolve_from_filesdir(filesdir, raw_path):
+        """
+        Resolve config paths against FILESDIR while being tolerant to
+        Windows-style backslashes in YAML files.
+        """
+        raw_path = raw_path.replace("\\", os.sep)
+        if os.path.isabs(raw_path):
+            return os.path.normpath(raw_path)
+        return os.path.normpath(os.path.join(filesdir, raw_path))
+
     with open(path, 'r') as file:
         config = yaml.safe_load(file)
+        filesdir = os.environ['FILESDIR']
         # add paths
         for rel_path in ['out-dir', 'data-dir', 'fid-stats-path', 'test-noise']:
-            config[rel_path] = os.environ['FILESDIR'] + '/' + config[rel_path]
+            config[rel_path] = resolve_from_filesdir(filesdir, config[rel_path])
+        if isinstance(config["fixed-noise"], str):
+            config["fixed-noise"] = resolve_from_filesdir(filesdir, config["fixed-noise"])
         config['train']['step-2']['classifier'] = [
-            os.environ['FILESDIR'] + '/' + rel_path for rel_path in config['train']['step-2']['classifier']]
-        os.makedirs(config['out-dir'], exist_ok=True)
+            resolve_from_filesdir(filesdir, rel_path)
+            for rel_path in config['train']['step-2']['classifier']
+        ]
         os.makedirs(config['out-dir'], exist_ok=True)
         os.makedirs(config['data-dir'], exist_ok=True)
         # if fid-stats-path is a file, ensure its parent dir exists

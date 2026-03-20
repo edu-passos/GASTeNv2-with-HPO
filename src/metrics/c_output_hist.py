@@ -4,91 +4,116 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torchvision.transforms import ToTensor
 import PIL
+
 from .metric import Metric
 from .hubris import Hubris
 
 
 class OutputsHistogram(Metric):
-    def __init__(self, C, dataset_size):
+    """
+    Collects classifier output probabilities (positive class) across the evaluation set
+    and provides plotting utilities that are safe in headless training (no plt.show()).
+
+    Works with:
+      - binary logits shape [B] or [B,1]  -> sigmoid
+      - multiclass logits shape [B,K]     -> softmax -> take class 1 prob by convention
+      - feature-map API: C(x, output_feature_maps=True) returning tuple/list with logits at index 0
+    """
+    def __init__(self, C, dataset_size: int):
         super().__init__()
         self.C = C
-        self.dataset_size = dataset_size
-        self.y_hat = torch.zeros(dataset_size, dtype=torch.float32)
+        self.dataset_size = int(dataset_size)
+        self.y_hat = torch.zeros(self.dataset_size, dtype=torch.float32)
         self.to_tensor = ToTensor()
-        self.hubris = Hubris(C, dataset_size)
+        self.hubris = Hubris(C, self.dataset_size)
+
+    def _clf_logits(self, images: torch.Tensor) -> torch.Tensor:
+        # Prefer feature-map API if available; else plain forward
+        try:
+            out = self.C(images, output_feature_maps=True)
+            logits = out[0]  # convention used elsewhere in your repo
+        except TypeError:
+            logits = self.C(images)
+        return logits
+
+    @staticmethod
+    def _to_pos_prob(logits: torch.Tensor) -> torch.Tensor:
+        """
+        Convert logits to probability for "positive class".
+        Convention:
+          - if logits is [B, K] with K>=2 -> use softmax[:,1]
+          - else -> sigmoid(logits)
+        """
+        if logits.ndim == 2 and logits.size(1) >= 2:
+            return F.softmax(logits, dim=1)[:, 1]
+        return torch.sigmoid(logits.view(-1))
 
     @torch.no_grad()
     def update(self, images, batch):
         start, bs = batch
-        # update hubris metric
+        start = int(start)
+        bs = int(bs)
+
+        # keep hubris in sync
         self.hubris.update(images, batch)
 
-        # get classifier outputs
-        logits = self.C(images)
-        if logits.dim() > 1 and logits.size(1) > 1:
-            probs = F.softmax(logits, dim=1)[:, 1]
-        else:
-            probs = torch.sigmoid(logits).view(-1)
+        logits = self._clf_logits(images)
+        probs = self._to_pos_prob(logits)
 
-        # store in the running buffer
-        self.y_hat[start:start + bs] = probs.cpu()
+        # store on CPU
+        self.y_hat[start:start + bs] = probs.detach().float().cpu()
 
-    def _var_safe_plot(self, data, ax, title, bins=20, xlim=None):
-        # choose histogram vs KDE depending on variance
-        if np.var(data) < 1e-6:
-            ax.hist(data, bins=bins, density=True)
-        else:
-            import seaborn as sns
-            sns.kdeplot(data, ax=ax, fill=True, warn_singular=False)
-        ax.set(title=title)
-        if xlim:
+    def _hist_plot(self, data: np.ndarray, ax, title: str, bins: int = 30, xlim=None):
+        # Always use histogram (no seaborn dependency; stable headless)
+        ax.hist(data, bins=bins, density=True)
+        ax.set_title(title)
+        if xlim is not None:
             ax.set_xlim(*xlim)
 
     def plot(self):
-        # simple single‐plot view
-        plt.figure()
-        self._var_safe_plot(
-            self.y_hat.numpy(),
-            plt.gca(),
-            "Classifier Output Distribution",
-            bins=20,
-            xlim=(0, 1),
-        )
-        plt.xlabel("Prediction")
-        plt.ylabel("Proportion")
-        plt.show()
+        """
+        Returns a torch.Tensor image (CHW) of a single histogram plot.
+        Does NOT call plt.show().
+        """
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+
+        data = self.y_hat.numpy()
+        self._hist_plot(data, ax, "Classifier Output Distribution", bins=30, xlim=(0, 1))
+        ax.set_xlabel("Prediction")
+        ax.set_ylabel("Density")
+
+        fig.canvas.draw()
+        buf, (w, h) = fig.canvas.print_to_buffer()
+        arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+        img = PIL.Image.fromarray(arr, mode="RGBA").convert("RGB")
+        plt.close(fig)
+        return self.to_tensor(img)
 
     def plot_clfs(self):
-        # 3‐panel figure: output dist, confusion dist, hubris
-        fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+        """
+        Returns a torch.Tensor image (CHW) with:
+          1) output probability distribution
+          2) confusion distance distribution |p-0.5|
+          3) hubris scalar bar
+        """
+        fig, axs = plt.subplots(1, 3, figsize=(18, 5))
 
-        self._var_safe_plot(
-            self.y_hat.numpy(),
-            axs[0],
-            "Classifier Output Distribution",
-            bins=20,
-            xlim=(0, 1),
-        )
+        p = self.y_hat.numpy()
+        self._hist_plot(p, axs[0], "Classifier Output Distribution", bins=30, xlim=(0, 1))
 
-
-        cd = np.abs(0.5 - self.y_hat.numpy())
-        self._var_safe_plot(
-            cd,
-            axs[1],
-            "Confusion Distance Distribution",
-            bins=20,
-            xlim=(0, 0.5),
-        )
+        cd = np.abs(0.5 - p)
+        self._hist_plot(cd, axs[1], "Confusion Distance Distribution", bins=30, xlim=(0, 0.5))
 
         hubris_val = float(self.hubris.finalize())
         axs[2].bar(["Hubris"], [hubris_val])
         axs[2].set_ylim(0, 1)
+        axs[2].set_title("Hubris")
 
+        fig.tight_layout()
         fig.canvas.draw()
 
         buf, (w, h) = fig.canvas.print_to_buffer()
         arr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-
         img = PIL.Image.fromarray(arr, mode="RGBA").convert("RGB")
         plt.close(fig)
         return self.to_tensor(img)

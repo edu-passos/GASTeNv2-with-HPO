@@ -337,18 +337,22 @@ class FIDInceptionE_2(torchvision.models.inception.InceptionE):
 def get_inception_feature_map_fn(device):
     dims = 2048
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-    model = InceptionV3([block_idx]).to(device)
+
+    # expects [0,1] because normalize_input=False
+    model = InceptionV3([block_idx], normalize_input=False).to(device)
     model.eval()
 
     def get_feature_map_fn(images, batch_idx, batch):
-        # if image is grayscale, replicate channel 3 times
+        # images are in [-1,1] (dataset Normalize(0.5,0.5) and G(tanh))
+        images = images.float()
+        images = images.mul(0.5).add(0.5).clamp_(0.0, 1.0)  # [-1,1] -> [0,1]
+
+        # if grayscale, replicate to 3-ch
         if images.size(1) == 1:
             images = images.expand(-1, 3, -1, -1)
 
-        pred = model(images)[0]
+        pred = model(images.to(device, non_blocking=True))[0]
 
-        # If model output is not scalar, apply global spatial average pooling.
-        # This happens if you choose a dimensionality not equal 2048.
         if pred.size(2) != 1 or pred.size(3) != 1:
             pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
 

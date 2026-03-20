@@ -159,6 +159,20 @@ def get_gan_path_at_epoch(output_dir, epoch=None):
 
     return os.path.join(base, es)
 
+def load_gan_train_state(output_dir: str):
+    """
+    Load the GAN training state saved by checkpoint_gan().
+
+    Expected file: <output_dir>/train_state.json
+    Returns: dict (may be empty if missing)
+    """
+    path = os.path.join(str(output_dir), "train_state.json")
+    if not os.path.exists(path):
+        # be defensive: some older runs might not have it
+        return {}
+    with open(path, "r") as f:
+        return json.load(f)
+
 
 def checkpoint_gan(G, D, g_opt, d_opt, state, stats,
                    config, output_dir=None, epoch=None):
@@ -166,6 +180,8 @@ def checkpoint_gan(G, D, g_opt, d_opt, state, stats,
         epoch, output_dir = output_dir, None
 
     rootdir = os.path.curdir if output_dir is None else str(output_dir)
+    os.makedirs(rootdir, exist_ok=True)  # <-- IMPORTANT: ensure root exists
+
     path = get_gan_path_at_epoch(rootdir, epoch)
     os.makedirs(path, exist_ok=True)
 
@@ -185,6 +201,7 @@ def checkpoint_gan(G, D, g_opt, d_opt, state, stats,
 
     print(f'> Saved checkpoint to {path}')
     return path
+
 
 
 def checkpoint_image(image, epoch, output_dir=None):

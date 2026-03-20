@@ -2,7 +2,7 @@ project: bayesian_mnist
 name: optimization
 out-dir: out
 data-dir: data
-test-noise: data/z\z_2048_64
+test-noise: data/z/z_2048_64
 fixed-noise: 2500
 
 device: cuda:0

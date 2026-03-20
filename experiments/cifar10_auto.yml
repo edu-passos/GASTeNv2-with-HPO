@@ -21,24 +21,26 @@ dataset:
 model:
   z_dim: 64
   architecture:
-    name: dcgan
+    name: cifar10_sagan
     g_filter_dim: 64
     d_filter_dim: 64
     g_num_blocks: 3
     d_num_blocks: 3
   loss:
-    name: ns
+    name: hinge-r1
+    args:
+      lambda: 10.0
 
 optimizer:
   lr: 0.0002
-  beta1: 0.5
-  beta2: 0.999
+  beta1: 0.0
+  beta2: 0.9
 
 train:
   step-1:
-    epochs: 10
-    checkpoint-every: 1
-    disc-iters: 1
+    epochs: 120
+    checkpoint-every: 10
+    disc-iters: 2
     batch-size: 64
 
   step-2:
@@ -47,9 +49,9 @@ train:
     step-1-epochs:
       - best
     batch-size: 64
-    disc-iters: 1
+    disc-iters: 2
     weight:
       - gaussian:
           alpha: 1.0
           var: 0.01
-    classifier: ["models/cifar10.5v3/cnn-50-50.4441"]
+    classifier: ["models/cifar10/5v3/cnn-50-50.4441"]
