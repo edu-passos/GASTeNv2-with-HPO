@@ -9,6 +9,7 @@ import torch.nn as nn
 import wandb
 
 from smac import HyperparameterOptimizationFacade, Scenario
+from smac.multi_objective.parego import ParEGO
 from ConfigSpace import ConfigurationSpace, Float
 
 from src.metrics import fid, LossSecondTerm, Hubris
@@ -171,7 +172,11 @@ def main():
     run_id = wandb.util.generate_id()
     cp_dir = create_checkpoint_path(config, run_id)
 
-    def step2_obj(cfg_hp, seed: int) -> float:
+    # Track per-trial metrics so we can rebuild the Pareto front from the
+    # SMAC runhistory after optimisation (regardless of facade specifics).
+    trial_records: list[dict] = []
+
+    def step2_obj(cfg_hp, seed: int) -> dict:
         weight = {"gaussian": {"alpha": float(cfg_hp["alpha"]), "var": float(cfg_hp["var"])}}
 
         metrics = train_modified_gan(
@@ -185,12 +190,18 @@ def main():
         ev = metrics.get("eval", {})
         fid_list = ev.get("fid", [])
         cd_list = ev.get("conf_dist", [])
-        if not fid_list or not cd_list:
-            return float("inf")
+        f = float(fid_list[-1]) if fid_list else float("inf")
+        c = float(cd_list[-1]) if cd_list else float("inf")
 
-        f = float(fid_list[-1])
-        c = float(cd_list[-1])
-        return 1.0 * f + 0.001 * c
+        trial_records.append({
+            "alpha": float(cfg_hp["alpha"]),
+            "var": float(cfg_hp["var"]),
+            "fid": f,
+            "conf_dist": c,
+            "seed": int(seed),
+        })
+
+        return {"fid": f, "conf_dist": c}
 
     cs = ConfigurationSpace()
     cs.add_hyperparameters(
@@ -202,6 +213,7 @@ def main():
 
     scenario = Scenario(
         cs,
+        objectives=["fid", "conf_dist"],
         deterministic=True,
         n_trials=args.trials if args.trials is not None else config["train"]["step-2"].get("hpo-trials", 50),
         walltime_limit=(
@@ -211,9 +223,52 @@ def main():
         ),
     )
 
-    smac = HyperparameterOptimizationFacade(scenario, step2_obj, overwrite=True)
-    incumbent = smac.optimize()
-    best_cfg = incumbent.get_dictionary()
+    smac = HyperparameterOptimizationFacade(
+        scenario,
+        step2_obj,
+        multi_objective_algorithm=ParEGO(scenario),
+        overwrite=True,
+    )
+    smac.optimize()
+
+    # Build the Pareto front directly from our trial records — it's the
+    # most portable way across SMAC versions and gives us the metrics we
+    # already need for selection + reporting.
+    def _pareto(points: list[dict]) -> list[dict]:
+        out = []
+        for i, p in enumerate(points):
+            dominated = False
+            for j, q in enumerate(points):
+                if i == j:
+                    continue
+                if (q["fid"] <= p["fid"] and q["conf_dist"] <= p["conf_dist"]
+                        and (q["fid"] < p["fid"] or q["conf_dist"] < p["conf_dist"])):
+                    dominated = True
+                    break
+            if not dominated:
+                out.append(p)
+        out.sort(key=lambda r: (r["fid"], r["conf_dist"]))
+        return out
+
+    pareto = _pareto(trial_records)
+
+    pareto_json = os.path.join(cp_dir, f"step2-pareto-gauss-{pos}v{neg}.json")
+    with open(pareto_json, "w") as f:
+        json.dump({"pareto": pareto, "all_trials": trial_records}, f, indent=2)
+    print(f"   * Pareto front ({len(pareto)} pts) written → {pareto_json}")
+
+    # Recommended point: smallest conf_dist subject to FID within 10 % of
+    # the FID-best point on the Pareto front. Falls back to FID-best if
+    # the front is empty (e.g. all trials failed).
+    if pareto:
+        fid_best = min(p["fid"] for p in pareto)
+        budget = 1.1 * fid_best if fid_best > 0 else float("inf")
+        candidates = [p for p in pareto if p["fid"] <= budget] or pareto
+        recommended = min(candidates, key=lambda p: p["conf_dist"])
+        best_cfg = {"alpha": recommended["alpha"], "var": recommended["var"]}
+    else:
+        best_cfg = {"alpha": 1.0, "var": 0.01}
+        recommended = None
 
     out_json = os.path.join(cp_dir, f"step2-best-gauss-{pos}v{neg}.json")
     with open(out_json, "w") as f:
@@ -238,13 +293,20 @@ def main():
 
     summary_txt = os.path.join(cp_dir, f"step2-best-gauss-{pos}v{neg}-summary.txt")
     with open(summary_txt, "w") as f:
-        f.write("Best Gaussian parameters:\n")
+        f.write("Recommended Gaussian parameters (min conf_dist on Pareto, FID ≤ 1.1×best):\n")
         f.write(json.dumps(best_cfg, indent=2) + "\n\n")
-        f.write("Performance metrics:\n")
+        f.write("Final retrain metrics:\n")
         f.write(f"  FID       = {last_fid:.4f}\n")
         f.write(f"  Conf_dist = {last_cd:.4f}\n")
-        f.write(f"  Best Epoch= {best_epoch}\n")
-        f.write("\n")
+        f.write(f"  Best Epoch= {best_epoch}\n\n")
+        if pareto:
+            f.write("Pareto front (sorted by FID):\n")
+            for p in pareto:
+                f.write(
+                    f"  alpha={p['alpha']:.4f}  var={p['var']:.6f}  "
+                    f"FID={p['fid']:.4f}  conf_dist={p['conf_dist']:.4f}\n"
+                )
+            f.write("\n")
         f.write(f"Loaded step-1 checkpoint: {gan_ckpt_dir}\n")
 
     print("→ Step 2 complete.")

@@ -93,20 +93,31 @@ config_schema = Schema({
         "beta2": Or(float, int),
     },
     "train": {
+        Optional("perf"): {
+            Optional("cudnn_benchmark"): bool,
+            Optional("cudnn_deterministic"): bool,
+            Optional("tf32_matmul"): bool,
+        },
         "step-1": Or(And(str, os.path.exists), {
             "epochs": int,
             "checkpoint-every": int,
             "batch-size": int,
             "disc-iters": int,
-            Optional("early-stop"): {
-                "criteria": int,
-            }
+            Optional("early-stop"): Or(
+                {"criteria": int},
+                {Optional("patience"): int, Optional("min-epochs"): int},
+            ),
+            Optional("ema"): Or(bool, {Optional("decay"): Or(float, int)}),
+            Optional("amp"): Or(str, bool, None),
+            Optional("compile"): Or(str, bool, None),
+            Optional("compile_d"): Or(str, bool, None),
         }),
         "step-2": {
             Optional("step-1-epochs", default="best"): [Or(int, "best", "last")],
-            Optional("early-stop"): {
-                "criteria": int,
-            },
+            Optional("early-stop"): Or(
+                {"criteria": int},
+                {Optional("patience"): int, Optional("min-epochs"): int},
+            ),
             "epochs": int,
             "checkpoint-every": int,
             "batch-size": int,
@@ -120,7 +131,13 @@ config_schema = Schema({
                 "mgda:norm",
                 {"kldiv": {"alpha": float}},
                 {"gaussian-v2": {"alpha": float, "var": float}}
-            )]
+            )],
+            Optional("ema"): Or(bool, {Optional("decay"): Or(float, int)}),
+            Optional("amp"): Or(str, bool, None),
+            Optional("compile"): Or(str, bool, None),
+            Optional("compile_d"): Or(str, bool, None),
+            Optional("hpo-trials"): int,
+            Optional("hpo-walltime"): int,
         }
     }
 })

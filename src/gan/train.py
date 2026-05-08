@@ -6,12 +6,22 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+from contextlib import contextmanager
+
 from src.utils import (
     MetricsLogger,
     seed_worker,
     group_images,
 )
 from src.utils.checkpoint import checkpoint_gan, checkpoint_image
+from src.utils.ema import maybe_make_ema
+from src.utils.amp import parse_amp, autocast_ctx
+from src.utils.perf import apply_perf_settings, maybe_compile, unwrap_compiled
+
+
+@contextmanager
+def _nullctx(x):
+    yield x
 
 
 # ────────────────────────────────────────────────────────────────
@@ -47,9 +57,6 @@ def evaluate(
 
         with torch.no_grad():
             gen_batch = G(z_batch.to(device))
-        # quick collapse diagnostics
-        print("gen_batch std:", gen_batch.float().std().item(), "min/max:", gen_batch.min().item(), gen_batch.max().item())
-
 
         if rgb_repeat and gen_batch.shape[1] == 1:
             gen_batch = gen_batch.repeat_interleave(3, dim=1)
@@ -88,23 +95,28 @@ def train_disc(
     batch_size: int,
     train_metrics: MetricsLogger,
     device: torch.device,
+    *,
+    amp_dtype=None,
+    scaler=None,
 ):
     D.zero_grad()
-
-    # real pass
     real_data = real_data.to(device)
-    d_real = D(real_data)
 
-    # fake pass
-    noise = torch.randn(batch_size, G.z_dim, device=device)
-    with torch.no_grad():
-        fake_data = G(noise)
-    d_fake = D(fake_data.detach())
+    with autocast_ctx(amp_dtype, device):
+        d_real = D(real_data)
+        noise = torch.randn(batch_size, G.z_dim, device=device)
+        with torch.no_grad():
+            fake_data = G(noise)
+        d_fake = D(fake_data.detach())
+        d_loss, d_terms = d_crit(real_data, fake_data, d_real, d_fake, device)
 
-    # loss + update
-    d_loss, d_terms = d_crit(real_data, fake_data, d_real, d_fake, device)
-    d_loss.backward()
-    d_opt.step()
+    if scaler is not None:
+        scaler.scale(d_loss).backward()
+        scaler.step(d_opt)
+        scaler.update()
+    else:
+        d_loss.backward()
+        d_opt.step()
 
     for k, v in d_terms.items():
         train_metrics.update_it_metric(k, v)
@@ -124,9 +136,12 @@ def train_gen(
     batch_size: int,
     train_metrics: MetricsLogger,
     device: torch.device,
+    *,
+    amp_dtype=None,
+    scaler=None,
 ):
     noise = torch.randn(batch_size, G.z_dim, device=device)
-    g_loss, g_terms = update_fn(G, D, g_opt, noise, device)
+    g_loss, g_terms = update_fn(G, D, g_opt, noise, device, amp_dtype=amp_dtype, scaler=scaler)
 
     for k, v in g_terms.items():
         train_metrics.update_it_metric(k, v)
@@ -169,13 +184,28 @@ def train(
         else fixed_noise
     )
 
+    # train() is the step-2 entry point; read EMA + AMP + compile from there.
+    step2_cfg = config.get("train", {}).get("step-2", {})
+    ema_cfg = step2_cfg.get("ema", None)
+    g_ema = maybe_make_ema(ema_cfg, G)
+
+    amp_dtype, scaler = parse_amp(step2_cfg.get("amp", None))
+
+    apply_perf_settings(config.get("train", {}).get("perf", None))
+    G = maybe_compile(G, step2_cfg.get("compile", False))
+    D = maybe_compile(D, step2_cfg.get("compile_d", False))
+    g_raw = unwrap_compiled(G)
+
+    nw = int(config["num-workers"])
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=config["num-workers"],
+        num_workers=nw,
         worker_init_fn=seed_worker,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=nw > 0,
     )
 
     tr_log, ev_log = MetricsLogger("train"), MetricsLogger("eval")
@@ -203,6 +233,7 @@ def train(
             config=config,
             output_dir=checkpoint_dir,
             epoch=0,
+            g_ema=g_ema,
         )
 
     # -------- training loop ---------------------------------------
@@ -215,11 +246,15 @@ def train(
 
         for i in range(1, iters_per_epoch + 1):
             real, _ = next(it_loader)
-            train_disc(G, D, d_opt, d_crit, real, batch_size, tr_log, device)
+            train_disc(G, D, d_opt, d_crit, real, batch_size, tr_log, device,
+                       amp_dtype=amp_dtype, scaler=scaler)
 
             if i % n_disc_iters == 0:
                 g_it += 1
-                train_gen(g_updater, G, D, g_opt, batch_size, tr_log, device)
+                train_gen(g_updater, G, D, g_opt, batch_size, tr_log, device,
+                          amp_dtype=amp_dtype, scaler=scaler)
+                if g_ema is not None:
+                    g_ema.update(g_raw)
 
                 if g_it % log_every_g == 0 or g_it == iters_per_epoch // n_disc_iters:
                     try:
@@ -233,18 +268,20 @@ def train(
                         pass
 
         # ---------- epoch end: images & metrics -------------------
-        with torch.no_grad():
-            G.eval()
-            fake = G(fixed_noise).cpu()
-            G.train()
-        img = group_images(fake, classifier, device)
-        ev_log.log_image("samples", img)
-        if checkpoint_dir is not None:
-            checkpoint_image(img, epoch, checkpoint_dir)
+        ema_ctx = g_ema.swapped(g_raw) if g_ema is not None else _nullctx(G)
+        with ema_ctx:
+            with torch.no_grad():
+                G.eval()
+                fake = G(fixed_noise).cpu()
+                G.train()
+            img = group_images(fake, classifier, device)
+            ev_log.log_image("samples", img)
+            if checkpoint_dir is not None:
+                checkpoint_image(img, epoch, checkpoint_dir)
 
-        tr_log.finalize_epoch()
-        evaluate(G, fid_metrics, ev_log, batch_size, test_noise, device, c_out_hist)
-        ev_log.finalize_epoch()
+            tr_log.finalize_epoch()
+            evaluate(G, fid_metrics, ev_log, batch_size, test_noise, device, c_out_hist)
+            ev_log.finalize_epoch()
 
         if checkpoint_dir and (epoch % checkpoint_every == 0 or epoch == n_epochs):
             checkpoint_gan(
@@ -254,6 +291,7 @@ def train(
                 config=config,
                 output_dir=checkpoint_dir,
                 epoch=epoch,
+                g_ema=g_ema,
             )
 
 

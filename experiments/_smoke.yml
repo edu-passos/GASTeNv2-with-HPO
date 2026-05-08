@@ -1,0 +1,70 @@
+# Tiny end-to-end smoke config. Goal: ≤5 minutes on a single GPU.
+# Use to verify the full step-1 → step-2 path before kicking off real runs.
+#
+#   python -m src.optimization \
+#       --config experiments/_smoke.yml \
+#       --trials 2 --walltime 600 \
+#       --step2-trials 2 --step2-walltime 600
+#
+# Expects MNIST 7v1 assets under FILESDIR (z pool, FID stats, classifier ckpt).
+
+project: gasten_smoke
+name: smoke_mnist_7v1
+
+out-dir: out
+data-dir: data
+test-noise: data/z/z_512_64
+fixed-noise: 64
+
+device: cuda:0
+num-workers: 2
+
+fid-stats-path: data/fid-stats/stats.inception.mnist.7v1.npz
+
+num-runs: 1
+
+dataset:
+  name: mnist
+  binary:
+    pos: 7
+    neg: 1
+
+model:
+  z_dim: 64
+  architecture:
+    name: dcgan
+    g_filter_dim: 32
+    d_filter_dim: 32
+    g_num_blocks: 3
+    d_num_blocks: 3
+  loss:
+    name: ns
+
+optimizer:
+  lr: 0.0002
+  beta1: 0.5
+  beta2: 0.999
+
+train:
+  step-1:
+    epochs: 5
+    checkpoint-every: 1
+    disc-iters: 1
+    batch-size: 128
+    early-stop:
+      patience: 3
+      min-epochs: 2
+
+  step-2:
+    epochs: 3
+    checkpoint-every: 1
+    step-1-epochs:
+      - best
+    batch-size: 128
+    disc-iters: 1
+    weight:
+      - gaussian:
+          alpha: 1.0
+          var: 0.01
+    classifier:
+      - models/mnist/7v1/cnn-12-5.4441

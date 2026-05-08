@@ -96,7 +96,13 @@ def construct_classifier_from_checkpoint(path, device=None, optimizer=False):
         return model, cp['params'], cp['stats'], cp['args']
 
 
-def construct_gan_from_checkpoint(path, device=None):
+def construct_gan_from_checkpoint(path, device=None, prefer_ema=True):
+    """Reconstruct G/D from a step-1 checkpoint dir.
+
+    If ``prefer_ema`` is True and ``generator_ema.pth`` is present, the
+    generator weights are initialized from the EMA shadow instead of the raw
+    final weights — usually better samples and a stabler step-2 init.
+    """
     from src.gan import construct_gan
 
     print(f"Loading GAN from {path} ...")
@@ -126,7 +132,25 @@ def construct_gan_from_checkpoint(path, device=None):
 
     G, D = construct_gan(model_params, image_size, device=device)
 
-    G.load_state_dict(_sanitize_state_dict(gen_cp['state'], G))
+    ema_path = os.path.join(path, 'generator_ema.pth')
+    used_ema = False
+    if prefer_ema and os.path.exists(ema_path):
+        ema_blob = torch.load(ema_path, map_location=device, weights_only=False)
+        ema_params = ema_blob.get("params", {})
+        ema_buffers = ema_blob.get("buffers", {})
+        merged = G.state_dict()
+        for n, t in ema_params.items():
+            if n in merged and merged[n].shape == t.shape:
+                merged[n] = t.to(merged[n].device, dtype=merged[n].dtype)
+        for n, t in ema_buffers.items():
+            if n in merged and merged[n].shape == t.shape:
+                merged[n] = t.to(merged[n].device, dtype=merged[n].dtype)
+        G.load_state_dict(_sanitize_state_dict(merged, G))
+        used_ema = True
+        print(f"  > Loaded generator from EMA shadow ({ema_path})")
+    else:
+        G.load_state_dict(_sanitize_state_dict(gen_cp['state'], G))
+
     D.load_state_dict(_sanitize_state_dict(dis_cp['state'], D))
 
     g_optim = optim.Adam(G.parameters(),
@@ -136,7 +160,9 @@ def construct_gan_from_checkpoint(path, device=None):
                          lr=optim_params["lr"],
                          betas=(optim_params["beta1"], optim_params["beta2"]))
 
-    if 'optimizer' in gen_cp:
+    # Only restore optimizer state if we did NOT swap in EMA params (otherwise
+    # the optimizer's running statistics no longer correspond to the model).
+    if not used_ema and 'optimizer' in gen_cp:
         g_optim.load_state_dict(gen_cp['optimizer'])
     if 'optimizer' in dis_cp:
         d_optim.load_state_dict(dis_cp['optimizer'])
@@ -175,7 +201,7 @@ def load_gan_train_state(output_dir: str):
 
 
 def checkpoint_gan(G, D, g_opt, d_opt, state, stats,
-                   config, output_dir=None, epoch=None):
+                   config, output_dir=None, epoch=None, g_ema=None):
     if isinstance(output_dir, int) and epoch is None:
         epoch, output_dir = output_dir, None
 
@@ -185,15 +211,24 @@ def checkpoint_gan(G, D, g_opt, d_opt, state, stats,
     path = get_gan_path_at_epoch(rootdir, epoch)
     os.makedirs(path, exist_ok=True)
 
+    # Save the *raw* state dict so checkpoints are portable across
+    # torch.compile (the compiled wrapper rewrites parameter names with an
+    # ``_orig_mod.`` prefix that callers shouldn't have to deal with).
+    G_raw = getattr(G, "_orig_mod", G)
+    D_raw = getattr(D, "_orig_mod", D)
+
     torch.save({
-        'state': G.state_dict(),
+        'state': G_raw.state_dict(),
         'optimizer': g_opt.state_dict()
     }, os.path.join(path, 'generator.pth'))
 
     torch.save({
-        'state': D.state_dict(),
+        'state': D_raw.state_dict(),
         'optimizer': d_opt.state_dict()
     }, os.path.join(path, 'discriminator.pth'))
+
+    if g_ema is not None:
+        torch.save(g_ema.state_dict(), os.path.join(path, 'generator_ema.pth'))
 
     json.dump(state, open(os.path.join(rootdir, 'train_state.json'), 'w'), indent=2)
     json.dump(stats, open(os.path.join(rootdir, 'stats.json'), 'w'), indent=2)

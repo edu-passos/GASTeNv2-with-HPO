@@ -38,11 +38,23 @@ optimizer:
   beta2: 0.9
 
 train:
+  perf:
+    cudnn_benchmark: true
+    cudnn_deterministic: false
+    tf32_matmul: true
+
   step-1:
     epochs: 80
     checkpoint-every: 5
     disc-iters: 2
     batch-size: 8
+    early-stop:
+      patience: 15
+      min-epochs: 10
+    ema:
+      decay: 0.999
+    amp: bf16
+    compile: default       # G only — D stays eager because hinge-r1 does double backward
 
   step-2:
     epochs: 30
@@ -57,3 +69,7 @@ train:
           var: 0.01
     classifier:
       - "models/chest-xray/1v0/cnn-24-24-4441"
+    ema:
+      decay: 0.999
+    amp: bf16
+    compile: default

@@ -68,22 +68,26 @@ class WGP_DiscriminatorLoss(DiscriminatorLoss):
         self.lmbda = lmbda
 
     def calc_gradient_penalty(self, real_data, fake_data, device):
-        batch_size = real_data.size(0)
-        alpha = torch.rand(batch_size, 1, 1, 1, device=device).expand_as(real_data)
-        interpolates = (real_data + alpha * (fake_data - real_data)).detach()
-        interpolates.requires_grad_(True)
+        # Run in fp32 — second-order gradients through autocast are unstable.
+        with torch.autocast(device_type=device.type, enabled=False):
+            real_f = real_data.detach().float()
+            fake_f = fake_data.detach().float()
+            batch_size = real_f.size(0)
+            alpha = torch.rand(batch_size, 1, 1, 1, device=device).expand_as(real_f)
+            interpolates = (real_f + alpha * (fake_f - real_f)).detach()
+            interpolates.requires_grad_(True)
 
-        disc_interpolates = self.D(interpolates)
-        grad_outputs = torch.ones_like(disc_interpolates, device=device)
+            disc_interpolates = self.D(interpolates)
+            grad_outputs = torch.ones_like(disc_interpolates, device=device)
 
-        gradients = autograd.grad(
-            outputs=disc_interpolates, inputs=interpolates,
-            grad_outputs=grad_outputs,
-            create_graph=True, retain_graph=True
-        )[0]
+            gradients = autograd.grad(
+                outputs=disc_interpolates, inputs=interpolates,
+                grad_outputs=grad_outputs,
+                create_graph=True, retain_graph=True
+            )[0]
 
-        gradients_norm = gradients.view(batch_size, -1).norm(2, dim=1)
-        return ((gradients_norm - 1.)**2).mean()
+            gradients_norm = gradients.view(batch_size, -1).norm(2, dim=1)
+            return ((gradients_norm - 1.)**2).mean()
 
     def __call__(self, real_data, fake_data, real_output, fake_output, device):
         d_loss_real = -real_output.mean()
@@ -106,19 +110,21 @@ class HingeR1_DiscriminatorLoss(DiscriminatorLoss):
         self.r1_gamma = r1_gamma
 
     def calc_r1(self, real_data, device):
-        real_data.requires_grad_(True)
-        real_logits = self.D(real_data)
-        grad_outputs = torch.ones_like(real_logits, device=device)
-        grads = autograd.grad(
-            outputs=real_logits,
-            inputs=real_data,
-            grad_outputs=grad_outputs,
-            create_graph=True,
-            retain_graph=True
-        )[0]
-        # R1 penalty = ||∇ D(x)||^2
-        grads = grads.view(grads.size(0), -1)
-        return (grads.norm(2, dim=1) ** 2).mean()
+        # Run in fp32 — second-order gradients through autocast are unstable.
+        with torch.autocast(device_type=device.type, enabled=False):
+            real_f = real_data.detach().float().requires_grad_(True)
+            real_logits = self.D(real_f)
+            grad_outputs = torch.ones_like(real_logits, device=device)
+            grads = autograd.grad(
+                outputs=real_logits,
+                inputs=real_f,
+                grad_outputs=grad_outputs,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+            # R1 penalty = ||∇ D(x)||^2
+            grads = grads.view(grads.size(0), -1)
+            return (grads.norm(2, dim=1) ** 2).mean()
 
     def __call__(self, real_data, fake_data, real_output, fake_output, device):
         # 1) Hinge loss

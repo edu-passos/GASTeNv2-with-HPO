@@ -7,6 +7,7 @@ from torch.nn import GaussianNLLLoss, KLDivLoss, BCEWithLogitsLoss
 from contextlib import contextmanager
 from src.utils.min_norm_solvers import MinNormSolver
 from src.utils.classifier_io import as_pos_prob
+from src.utils.amp import autocast_ctx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ class UpdateGenerator:
     def __init__(self, crit):
         self.crit = crit  # MUST remain the GAN generator criterion
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
         raise NotImplementedError
 
     def get_loss_terms(self):
@@ -68,17 +69,22 @@ class UpdateGeneratorGAN(UpdateGenerator):
     def __init__(self, crit):
         super().__init__(crit)
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
-        with no_param_grads(D):
+        with no_param_grads(D), autocast_ctx(amp_dtype, device):
             fake_data = G(noise)
             d_out = D(fake_data)
             loss = self.crit(device, d_out)
 
-        loss.backward()
-        optim.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            optim.step()
         return loss, {}
 
     def get_loss_terms(self):
@@ -94,19 +100,24 @@ class UpdateGeneratorGASTEN(UpdateGenerator):
         self.C = C
         self.alpha = alpha
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
-        with no_param_grads(D), no_param_grads(self.C):
+        with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
             fake_data = G(noise)
             loss_adv = self.crit(device, D(fake_data))
             p = as_pos_prob(self.C(fake_data))
             loss_conf = (0.5 - p).abs().mean()
             loss = loss_adv + self.alpha * loss_conf
 
-        loss.backward()
-        optim.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            optim.step()
         return loss, {"original_g_loss": loss_adv.item(), "conf_dist_loss": loss_conf.item()}
 
     def get_loss_terms(self):
@@ -126,7 +137,9 @@ class UpdateGeneratorGASTEN_MGDA(UpdateGenerator):
     def gradient_normalizers(self, grads, loss):
         return loss.item() * np.sqrt(np.sum([g.pow(2).sum().item() for g in grads]))
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+        # MGDA performs multiple separate backwards to compute per-objective
+        # gradients; this is not safe to autocast/scale, so AMP is ignored here.
         params = [p for p in G.parameters() if p.requires_grad]
 
         # Objective 1: GAN adversarial
@@ -191,11 +204,11 @@ class UpdateGeneratorGASTEN_gaussian(UpdateGenerator):
         self.c_loss = GaussianNLLLoss(reduction="mean")
         self.target = 0.5
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
-        with no_param_grads(D), no_param_grads(self.C):
+        with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
             fake = G(noise)
 
             # Classifier ambiguity on P(pos)
@@ -208,9 +221,16 @@ class UpdateGeneratorGASTEN_gaussian(UpdateGenerator):
             loss_adv = self.crit(device, D(fake))
             loss = loss_adv + self.alpha * loss_conf
 
-        loss.backward()
-        clip_grad_norm_(G.parameters(), 0.50)
-        optim.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+            clip_grad_norm_(G.parameters(), 0.50)
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            clip_grad_norm_(G.parameters(), 0.50)
+            optim.step()
 
         return loss, {"original_g_loss": loss_adv.item(), "conf_dist_loss": loss_conf.item()}
 
@@ -230,11 +250,11 @@ class UpdateGeneratorGASTEN_gaussianV2(UpdateGenerator):
         self.c_loss = GaussianNLLLoss(reduction="mean")
         self.target = 0.5
 
-    def __call__(self, G, D, optim, noise, device):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
-        with no_param_grads(D), no_param_grads(self.C):
+        with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
             fake = G(noise)
 
             out = self.C(fake, output_feature_maps=True)
@@ -247,9 +267,16 @@ class UpdateGeneratorGASTEN_gaussianV2(UpdateGenerator):
             loss_adv = self.crit(device, D(fake))
             loss = loss_adv + self.alpha * loss_conf
 
-        loss.backward()
-        clip_grad_norm_(G.parameters(), 0.50)
-        optim.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+            clip_grad_norm_(G.parameters(), 0.50)
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            clip_grad_norm_(G.parameters(), 0.50)
+            optim.step()
 
         return loss, {"original_g_loss": loss_adv.item(), "conf_dist_loss": loss_conf.item()}
 
