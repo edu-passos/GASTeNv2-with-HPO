@@ -20,17 +20,22 @@ dataset:
     neg: 0
 
 model:
+  # 2 classes: pneumonia (1) vs normal (0). Enables class-conditional G + projection D.
+  num_classes: 2
   z_dim: 64
   architecture:
     name: chest-xray
     g_filter_dim: 64
     d_filter_dim: 64
+    # NOTE: chest-xray architecture derives block count from image-size; these are unused.
     g_num_blocks: 3
     d_num_blocks: 3
   loss:
     name: hinge-r1
     args:
-      lambda: 10.0
+      # Reduced from 10 → 5: previous setting let D dominate G, contributing to
+      # the mode collapse we observed.
+      lambda: 5.0
 
 optimizer:
   lr: 0.0002
@@ -46,8 +51,10 @@ train:
   step-1:
     epochs: 80
     checkpoint-every: 5
-    disc-iters: 2
-    batch-size: 8
+    # disc-iters=1 (was 2): gives G equal footing under hinge-r1.
+    disc-iters: 1
+    # Bumped from 8 → 16: bf16 keeps headroom on the 16 GB card; reduces gradient noise.
+    batch-size: 16
     early-stop:
       patience: 15
       min-epochs: 10
@@ -55,14 +62,18 @@ train:
       decay: 0.999
     amp: bf16
     compile: default       # G only — D stays eager because hinge-r1 does double backward
+    # DiffAugment: applied identically to real and fake before D. Critical for
+    # the small chest-xray dataset (~4k images) — the canonical fix for the
+    # collapse we observed.
+    diffaug: "color,translation,cutout"
 
   step-2:
     epochs: 30
     checkpoint-every: 5
     step-1-epochs:
       - best
-    batch-size: 8
-    disc-iters: 2
+    batch-size: 16
+    disc-iters: 1
     weight:
       - gaussian:
           alpha: 1.0
@@ -73,3 +84,4 @@ train:
       decay: 0.999
     amp: bf16
     compile: default
+    diffaug: "color,translation,cutout"

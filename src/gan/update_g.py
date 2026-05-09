@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from src.utils.min_norm_solvers import MinNormSolver
 from src.utils.classifier_io import as_pos_prob
 from src.utils.amp import autocast_ctx
+from src.gan import cond_forward
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +56,8 @@ class UpdateGenerator:
     def __init__(self, crit):
         self.crit = crit  # MUST remain the GAN generator criterion
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         raise NotImplementedError
 
     def get_loss_terms(self):
@@ -69,13 +71,15 @@ class UpdateGeneratorGAN(UpdateGenerator):
     def __init__(self, crit):
         super().__init__(crit)
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
         with no_param_grads(D), autocast_ctx(amp_dtype, device):
-            fake_data = G(noise)
-            d_out = D(fake_data)
+            fake_data = cond_forward(G, noise, y)
+            fake_for_d = augmenter(fake_data) if augmenter else fake_data
+            d_out = cond_forward(D, fake_for_d, y)
             loss = self.crit(device, d_out)
 
         if scaler is not None:
@@ -100,13 +104,17 @@ class UpdateGeneratorGASTEN(UpdateGenerator):
         self.C = C
         self.alpha = alpha
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
         with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
-            fake_data = G(noise)
-            loss_adv = self.crit(device, D(fake_data))
+            fake_data = cond_forward(G, noise, y)
+            fake_for_d = augmenter(fake_data) if augmenter else fake_data
+            loss_adv = self.crit(device, cond_forward(D, fake_for_d, y))
+            # Classifier sees the un-augmented fake: ambiguity is a property of
+            # the generated image, not of the augmentation.
             p = as_pos_prob(self.C(fake_data))
             loss_conf = (0.5 - p).abs().mean()
             loss = loss_adv + self.alpha * loss_conf
@@ -137,9 +145,11 @@ class UpdateGeneratorGASTEN_MGDA(UpdateGenerator):
     def gradient_normalizers(self, grads, loss):
         return loss.item() * np.sqrt(np.sum([g.pow(2).sum().item() for g in grads]))
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         # MGDA performs multiple separate backwards to compute per-objective
         # gradients; this is not safe to autocast/scale, so AMP is ignored here.
+        # Class conditioning + DiffAugment are not yet wired into MGDA either.
         params = [p for p in G.parameters() if p.requires_grad]
 
         # Objective 1: GAN adversarial
@@ -204,21 +214,23 @@ class UpdateGeneratorGASTEN_gaussian(UpdateGenerator):
         self.c_loss = GaussianNLLLoss(reduction="mean")
         self.target = 0.5
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
         with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
-            fake = G(noise)
+            fake = cond_forward(G, noise, y)
 
-            # Classifier ambiguity on P(pos)
+            # Classifier ambiguity on P(pos) — see un-augmented fake.
             p = as_pos_prob(self.C(fake))
             tgt = torch.full_like(p, fill_value=self.target, device=device)
             var = torch.full_like(p, fill_value=self.var, device=device)
             loss_conf = self.c_loss(p, tgt, var)
 
-            # GAN adversarial
-            loss_adv = self.crit(device, D(fake))
+            # GAN adversarial — D sees augmented fake (matches train_disc).
+            fake_for_d = augmenter(fake) if augmenter else fake
+            loss_adv = self.crit(device, cond_forward(D, fake_for_d, y))
             loss = loss_adv + self.alpha * loss_conf
 
         if scaler is not None:
@@ -250,12 +262,13 @@ class UpdateGeneratorGASTEN_gaussianV2(UpdateGenerator):
         self.c_loss = GaussianNLLLoss(reduction="mean")
         self.target = 0.5
 
-    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None):
+    def __call__(self, G, D, optim, noise, device, *, amp_dtype=None, scaler=None,
+                 y=None, augmenter=None):
         G.zero_grad()
         optim.zero_grad(set_to_none=True)
 
         with no_param_grads(D), no_param_grads(self.C), autocast_ctx(amp_dtype, device):
-            fake = G(noise)
+            fake = cond_forward(G, noise, y)
 
             out = self.C(fake, output_feature_maps=True)
             p = as_pos_prob(out)
@@ -264,7 +277,8 @@ class UpdateGeneratorGASTEN_gaussianV2(UpdateGenerator):
             var = torch.full_like(p, fill_value=self.var, device=device)
             loss_conf = self.c_loss(p, tgt, var)
 
-            loss_adv = self.crit(device, D(fake))
+            fake_for_d = augmenter(fake) if augmenter else fake
+            loss_adv = self.crit(device, cond_forward(D, fake_for_d, y))
             loss = loss_adv + self.alpha * loss_conf
 
         if scaler is not None:

@@ -21,6 +21,8 @@ from src.utils import MetricsLogger, group_images, load_z, seed_worker, setup_re
 from src.utils.ema import maybe_make_ema
 from src.utils.amp import parse_amp
 from src.utils.perf import apply_perf_settings, maybe_compile, unwrap_compiled
+from src.utils.diffaug import make_augmenter
+from src.gan import sample_labels
 from src.gan import construct_gan, construct_loss
 from src.gan.update_g import UpdateGeneratorGAN
 from src.gan.train import train_disc, train_gen, evaluate
@@ -101,6 +103,20 @@ def main() -> None:
     # D for the gradient penalty, which can recompile/fall back under dynamo.
     compile_d_mode = cfg["train"]["step-1"].get("compile_d", False)
 
+    # Class-conditional flag: derived from cfg.dataset.binary (always 2 classes
+    # for the GASTeN binary task). Allow explicit override via cfg.model.num_classes.
+    num_classes = int(cfg.get("model", {}).get("num_classes", 0) or 0)
+    if num_classes <= 0 and "binary" in ds_cfg:
+        num_classes = 2
+    # Stash on the model config so per-epoch config.json round-trips it and
+    # step-2's construct_gan_from_checkpoint rebuilds with the same shape.
+    cfg["model"]["num_classes"] = num_classes
+
+    # DiffAugment: a no-op when policy is None / "" / not set.
+    augmenter = make_augmenter(cfg["train"]["step-1"].get("diffaug", None))
+    if augmenter:
+        print(f"[step1] DiffAugment policy active: {[op.__name__ for op in augmenter.ops]}")
+
     # FID
     fm, dims = fid.get_inception_feature_map_fn(device)
     mu, sigma = fid.load_statistics_from_path(cfg["fid-stats-path"])
@@ -141,10 +157,7 @@ def main() -> None:
 
         setup_reprod(seed)
 
-        arch = cfg["model"]["architecture"]
-        arch["g_num_blocks"] = arch["d_num_blocks"] = int(params["n_blocks"])
-
-        G, D = construct_gan(cfg["model"], img_size, device)
+        G, D = construct_gan(cfg["model"], img_size, device, num_classes=num_classes)
         # EMA must reference the *raw* module so parameter names are stable
         # across torch.compile (compile wraps params under _orig_mod.).
         g_ema = maybe_make_ema(ema_cfg, G)
@@ -191,12 +204,14 @@ def main() -> None:
             it_dl = iter(dl)
 
             for i in range(1, iters_per_epoch + 1):
-                real, _ = next(it_dl)
+                real, real_y = next(it_dl)
                 train_disc(G, D, d_opt, d_crit, real, batch_size, tr_log, device,
-                           amp_dtype=amp_dtype, scaler=scaler)
+                           amp_dtype=amp_dtype, scaler=scaler,
+                           real_label=real_y, augmenter=augmenter)
                 if i % n_disc_iters == 0:
                     train_gen(g_up, G, D, g_opt, batch_size, tr_log, device,
-                              amp_dtype=amp_dtype, scaler=scaler)
+                              amp_dtype=amp_dtype, scaler=scaler,
+                              augmenter=augmenter)
                     if g_ema is not None:
                         g_ema.update(g_raw)
 
@@ -206,7 +221,16 @@ def main() -> None:
             with ema_ctx:
                 with torch.no_grad():
                     G.eval()
-                    fake = G(fixed_noise).cpu()
+                    if num_classes > 1:
+                        # Half class 0, half class 1: preview shows both modes.
+                        n_fixed = fixed_noise.size(0)
+                        fixed_y = torch.cat([
+                            torch.zeros(n_fixed // 2, dtype=torch.long, device=device),
+                            torch.ones(n_fixed - n_fixed // 2, dtype=torch.long, device=device),
+                        ])
+                        fake = G(fixed_noise, fixed_y).cpu()
+                    else:
+                        fake = G(fixed_noise).cpu()
                     G.train()
                 ev_log.log_image("samples", group_images(fake, None, device))
 
@@ -279,16 +303,23 @@ def main() -> None:
 
         return trial_best_fid
 
+    # Notes on the search space:
+    # - beta1 default 0.0 with a tight range [0.0, 0.3]: hinge-r1 (and most
+    #   spectral-norm setups) want very low first-moment momentum on the disc.
+    #   The previous default of 0.5 plus a wide range was the proximate cause
+    #   of the mode-collapse trial we observed in the chest-xray run.
+    # - beta2 narrowed to [0.99, 0.9999]: 0.9 is too low for these arches.
+    # - n_blocks dropped: chest-xray's StyleGAN2 generator derives its block
+    #   count from img-size and silently ignores this HP.
     hp_space = ConfigurationSpace()
     hp_space.add_hyperparameters(
         [
             Float("g_lr", (1e-5, 1e-3), default=2e-4, log=True),
             Float("d_lr", (1e-5, 1e-3), default=2e-4, log=True),
-            Float("g_beta1", (0.0, 0.9), default=0.5),
-            Float("d_beta1", (0.0, 0.9), default=0.5),
-            Float("g_beta2", (0.9, 0.9999), default=0.999),
-            Float("d_beta2", (0.9, 0.9999), default=0.999),
-            Integer("n_blocks", (4, 5), default=4),
+            Float("g_beta1", (0.0, 0.3), default=0.0),
+            Float("d_beta1", (0.0, 0.3), default=0.0),
+            Float("g_beta2", (0.99, 0.9999), default=0.999),
+            Float("d_beta2", (0.99, 0.9999), default=0.999),
         ]
     )
 

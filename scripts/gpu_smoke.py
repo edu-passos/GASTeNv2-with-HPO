@@ -25,6 +25,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from src.gan import construct_gan, construct_loss
+from src.gan.architectures.chest_xray import Generator as CXR_G, Discriminator as CXR_D
 from src.gan.train import train_disc, train_gen
 from src.gan.update_g import UpdateGeneratorGAN
 from src.utils.ema import EMA, maybe_make_ema
@@ -32,6 +33,7 @@ from src.utils.amp import parse_amp
 from src.utils.perf import apply_perf_settings, maybe_compile, unwrap_compiled
 from src.utils.metrics_logger import MetricsLogger
 from src.utils.checkpoint import checkpoint_gan, construct_gan_from_checkpoint
+from src.utils.diffaug import DiffAugmenter
 
 
 def _model_cfg(loss_name: str) -> dict:
@@ -204,7 +206,87 @@ def main() -> None:
     _step("hinge-r1", amp_mode="bf16", compile_g=True,  device=device)
 
     _checkpoint_roundtrip(device)
+    _conditional_diffaug_smoke(device)
     print("\nALL SMOKE CHECKS PASSED")
+
+
+def _conditional_diffaug_smoke(device: torch.device) -> None:
+    print("\n=== conditional G+D + DiffAugment + bf16 + EMA + hinge-r1 ===")
+    img_size = (1, 128, 128)
+    G = CXR_G(img_size=img_size, z_dim=64, fmap=32, num_classes=2).to(device)
+    D = CXR_D(img_size=img_size, fmap=32, num_classes=2).to(device)
+    assert G.num_classes == 2 and D.num_classes == 2
+
+    g_ema = EMA(G, decay=0.9)
+    aug = DiffAugmenter("color,translation,cutout")
+    cfg_loss = {"name": "hinge-r1", "args": {"lambda": 5.0}}
+    g_crit, d_crit = construct_loss(cfg_loss, D)
+    g_up = UpdateGeneratorGAN(g_crit)
+    g_opt = Adam(G.parameters(), lr=2e-4, betas=(0.0, 0.999))
+    d_opt = Adam(D.parameters(), lr=2e-4, betas=(0.0, 0.999))
+
+    tr_log, _ = _make_logger(g_up, d_crit)
+
+    bs = 4
+    real = torch.randn(bs, *img_size, device=device)
+    real_y = torch.randint(0, 2, (bs,), device=device)
+
+    losses = []
+    for _ in range(3):
+        train_disc(G, D, d_opt, d_crit, real, bs, tr_log, device,
+                   amp_dtype=torch.bfloat16, real_label=real_y, augmenter=aug)
+        gl, _ = train_gen(g_up, G, D, g_opt, bs, tr_log, device,
+                          amp_dtype=torch.bfloat16, augmenter=aug)
+        g_ema.update(G)
+        losses.append(float(gl))
+
+    for L in losses:
+        assert L == L, f"NaN G loss in cond+diffaug path: {L}"
+    print(f"  losses: {[round(L, 4) for L in losses]}  ok")
+
+    # boundary-mix sample (continuous y in [0,1] for binary)
+    z = torch.randn(4, 64, device=device)
+    y_soft = torch.linspace(0.0, 1.0, 4, device=device)
+    with torch.no_grad():
+        x_soft = G(z, y_soft)
+    assert x_soft.shape == (4, 1, 128, 128) and torch.isfinite(x_soft).all()
+    print(f"  continuous-y interpolation OK  shape={tuple(x_soft.shape)}")
+
+    # checkpoint round-trip preserves num_classes via the saved config
+    full_cfg = {
+        "model": {
+            "num_classes": 2,
+            "z_dim": 64,
+            "image-size": list(img_size),
+            "architecture": {
+                "name": "chest-xray",
+                "g_filter_dim": 32,
+                "d_filter_dim": 32,
+                "g_num_blocks": 3,
+                "d_num_blocks": 3,
+            },
+            "loss": cfg_loss,
+        },
+        "optimizer": {"lr": 2e-4, "beta1": 0.0, "beta2": 0.999},
+    }
+    tmp = tempfile.mkdtemp(prefix="gpu_smoke_cond_")
+    try:
+        ckpt_path = checkpoint_gan(
+            G, D, g_opt, d_opt,
+            state={"epoch": 1, "best_epoch": 1, "best_fid": 1.0, "seed": 0},
+            stats={},
+            config=full_cfg,
+            output_dir=tmp,
+            epoch=1,
+            g_ema=g_ema,
+        )
+        G2, D2, _, _ = construct_gan_from_checkpoint(ckpt_path, device=device, prefer_ema=True)
+        assert G2.num_classes == 2 and D2.num_classes == 2, (
+            f"num_classes lost in roundtrip: G2={G2.num_classes} D2={D2.num_classes}"
+        )
+        print(f"  checkpoint roundtrip preserves num_classes  G2.nc={G2.num_classes}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

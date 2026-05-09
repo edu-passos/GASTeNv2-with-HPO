@@ -130,7 +130,8 @@ def construct_gan_from_checkpoint(path, device=None, prefer_ema=True):
     else:
         raise KeyError("Could not find 'image-size' or 'image_size' in model configuration.")
 
-    G, D = construct_gan(model_params, image_size, device=device)
+    num_classes = int(model_params.get('num_classes', 0) or 0)
+    G, D = construct_gan(model_params, image_size, device=device, num_classes=num_classes)
 
     ema_path = os.path.join(path, 'generator_ema.pth')
     used_ema = False

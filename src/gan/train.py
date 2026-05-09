@@ -17,6 +17,8 @@ from src.utils.checkpoint import checkpoint_gan, checkpoint_image
 from src.utils.ema import maybe_make_ema
 from src.utils.amp import parse_amp, autocast_ctx
 from src.utils.perf import apply_perf_settings, maybe_compile, unwrap_compiled
+from src.utils.diffaug import make_augmenter
+from src.gan import cond_forward, sample_labels
 
 
 @contextmanager
@@ -48,6 +50,7 @@ def evaluate(
     was_training = G.training
     G.eval()
 
+    nc = int(getattr(G, "num_classes", 0) or 0)
     n_batches = math.ceil(test_noise.size(0) / batch_size)
     start = 0
 
@@ -56,7 +59,13 @@ def evaluate(
         z_batch = test_noise[start : start + real_sz]
 
         with torch.no_grad():
-            gen_batch = G(z_batch.to(device))
+            if nc > 1:
+                # Balanced class mix per batch: alternating labels so FID
+                # reflects both modes, not a single one.
+                y_batch = (torch.arange(real_sz, device=device) % nc)
+                gen_batch = G(z_batch.to(device), y_batch)
+            else:
+                gen_batch = G(z_batch.to(device))
 
         if rgb_repeat and gen_batch.shape[1] == 1:
             gen_batch = gen_batch.repeat_interleave(3, dim=1)
@@ -98,17 +107,31 @@ def train_disc(
     *,
     amp_dtype=None,
     scaler=None,
+    real_label=None,
+    augmenter=None,
 ):
     D.zero_grad()
     real_data = real_data.to(device)
+    if real_label is not None:
+        real_label = real_label.to(device)
+
+    # Same augmentation applied to real and fake before D — gradients flow
+    # back through G in the updater path.
+    real_in = augmenter(real_data) if augmenter else real_data
+
+    fake_label = sample_labels(G, batch_size, device)
 
     with autocast_ctx(amp_dtype, device):
-        d_real = D(real_data)
+        d_real = cond_forward(D, real_in, real_label)
         noise = torch.randn(batch_size, G.z_dim, device=device)
         with torch.no_grad():
-            fake_data = G(noise)
-        d_fake = D(fake_data.detach())
-        d_loss, d_terms = d_crit(real_data, fake_data, d_real, d_fake, device)
+            fake_data = cond_forward(G, noise, fake_label)
+        fake_in = augmenter(fake_data) if augmenter else fake_data
+        d_fake = cond_forward(D, fake_in.detach(), fake_label)
+        d_loss, d_terms = d_crit(
+            real_in, fake_in, d_real, d_fake, device,
+            real_label=real_label, fake_label=fake_label,
+        )
 
     if scaler is not None:
         scaler.scale(d_loss).backward()
@@ -139,9 +162,15 @@ def train_gen(
     *,
     amp_dtype=None,
     scaler=None,
+    augmenter=None,
 ):
     noise = torch.randn(batch_size, G.z_dim, device=device)
-    g_loss, g_terms = update_fn(G, D, g_opt, noise, device, amp_dtype=amp_dtype, scaler=scaler)
+    fake_label = sample_labels(G, batch_size, device)
+    g_loss, g_terms = update_fn(
+        G, D, g_opt, noise, device,
+        amp_dtype=amp_dtype, scaler=scaler,
+        y=fake_label, augmenter=augmenter,
+    )
 
     for k, v in g_terms.items():
         train_metrics.update_it_metric(k, v)
@@ -196,6 +225,9 @@ def train(
     D = maybe_compile(D, step2_cfg.get("compile_d", False))
     g_raw = unwrap_compiled(G)
 
+    augmenter = make_augmenter(step2_cfg.get("diffaug", None))
+    nc = int(getattr(g_raw, "num_classes", 0) or 0)
+
     nw = int(config["num-workers"])
     loader = DataLoader(
         dataset,
@@ -221,7 +253,15 @@ def train(
     # -------- initial snapshot ------------------------------------
     with torch.no_grad():
         G.eval()
-        first_fake = G(fixed_noise).cpu()
+        if nc > 1:
+            n_fixed = fixed_noise.size(0)
+            fixed_y = torch.cat([
+                torch.zeros(n_fixed // 2, dtype=torch.long, device=device),
+                torch.ones(n_fixed - n_fixed // 2, dtype=torch.long, device=device),
+            ])
+        else:
+            fixed_y = None
+        first_fake = (G(fixed_noise, fixed_y) if fixed_y is not None else G(fixed_noise)).cpu()
         G.train()
     img0 = group_images(first_fake, classifier, device)
     if checkpoint_dir is not None:
@@ -245,14 +285,16 @@ def train(
         g_it = 0
 
         for i in range(1, iters_per_epoch + 1):
-            real, _ = next(it_loader)
+            real, real_y = next(it_loader)
             train_disc(G, D, d_opt, d_crit, real, batch_size, tr_log, device,
-                       amp_dtype=amp_dtype, scaler=scaler)
+                       amp_dtype=amp_dtype, scaler=scaler,
+                       real_label=real_y, augmenter=augmenter)
 
             if i % n_disc_iters == 0:
                 g_it += 1
                 train_gen(g_updater, G, D, g_opt, batch_size, tr_log, device,
-                          amp_dtype=amp_dtype, scaler=scaler)
+                          amp_dtype=amp_dtype, scaler=scaler,
+                          augmenter=augmenter)
                 if g_ema is not None:
                     g_ema.update(g_raw)
 
@@ -272,7 +314,7 @@ def train(
         with ema_ctx:
             with torch.no_grad():
                 G.eval()
-                fake = G(fixed_noise).cpu()
+                fake = (G(fixed_noise, fixed_y) if fixed_y is not None else G(fixed_noise)).cpu()
                 G.train()
             img = group_images(fake, classifier, device)
             ev_log.log_image("samples", img)

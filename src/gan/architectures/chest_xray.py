@@ -159,15 +159,29 @@ class DBlock(nn.Module):
 # Generator / Discriminator
 # ---------------------------------------------------------------------
 class Generator(nn.Module):
-    def __init__(self, img_size=(1, 128, 128), z_dim=128, fmap=64, w_dim=512, clamp_tanh: bool = True, **_):
+    """StyleGAN2-style chest-xray generator, optionally class-conditional.
+
+    When ``num_classes > 1`` a class embedding is added to the mapping output;
+    pass ``y`` (LongTensor) to ``forward``. Float ``y`` is also accepted: it's
+    used as a one-hot-like soft mix between the class embeddings, which lets
+    callers (e.g. step-2) interpolate between classes for boundary search.
+    """
+    def __init__(self, img_size=(1, 128, 128), z_dim=128, fmap=64, w_dim=512,
+                 num_classes: int = 0, clamp_tanh: bool = True, **_):
         super().__init__()
         self.z_dim = z_dim
+        self.num_classes = int(num_classes)
         self.clamp_tanh = clamp_tanh
 
         c, h, _ = img_size
         log_res = int(math.log2(h))
 
         self.mapping = Mapping(z_dim=z_dim, w_dim=w_dim)
+
+        if self.num_classes > 1:
+            # init small so conditioning starts as a perturbation
+            self.class_emb = nn.Embedding(self.num_classes, w_dim)
+            nn.init.normal_(self.class_emb.weight, mean=0.0, std=0.02)
 
         # small constant init (critical)
         self.const = nn.Parameter(torch.randn(1, fmap * 16, 4, 4) * 0.02)
@@ -193,11 +207,31 @@ class Generator(nn.Module):
 
         self.tanh = nn.Tanh()
 
-        # init “regular” conv/linear; ModConv.affine is protected by _skip_he_init
+        # init "regular" conv/linear; ModConv.affine is protected by _skip_he_init
         self.apply(he_init)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def _class_offset(self, y: torch.Tensor | None, n: int, device, dtype) -> torch.Tensor | None:
+        if self.num_classes <= 1:
+            return None
+        if y is None:
+            # uniform random class per sample
+            y = torch.randint(0, self.num_classes, (n,), device=device)
+        if y.dtype.is_floating_point:
+            # treat as continuous mix over class embeddings (n,) ∈ [0,1] for binary,
+            # or (n, num_classes) for general soft labels.
+            if y.dim() == 1:
+                # binary case: y is a P(class=1) score
+                e0 = self.class_emb.weight[0]
+                e1 = self.class_emb.weight[1] if self.num_classes > 1 else e0
+                return ((1.0 - y).unsqueeze(-1) * e0 + y.unsqueeze(-1) * e1).to(dtype)
+            return (y.to(dtype) @ self.class_emb.weight).to(dtype)
+        return self.class_emb(y.to(torch.long)).to(dtype)
+
+    def forward(self, z: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
         w = self.mapping(z)
+        offset = self._class_offset(y, z.size(0), z.device, w.dtype)
+        if offset is not None:
+            w = w + offset
         x = self.const.expand(z.size(0), -1, -1, -1)
 
         rgb = None
@@ -222,9 +256,17 @@ class Generator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, img_size=(1, 128, 128), fmap=64, is_critic=False, **_):
+    """Projection-style class-conditional discriminator (Miyato 2018).
+
+    When ``num_classes > 1``, output is the standard logit plus a projection
+    term ``<features, class_emb(y)>``. When unconditional or ``y is None`` the
+    projection term is zero — the unconditional path is unchanged.
+    """
+    def __init__(self, img_size=(1, 128, 128), fmap=64, num_classes: int = 0,
+                 is_critic=False, **_):
         super().__init__()
         self.is_critic = bool(is_critic)
+        self.num_classes = int(num_classes)
 
         c, h, _ = img_size
         log_res = int(math.log2(h))
@@ -242,15 +284,33 @@ class Discriminator(nn.Module):
             in_ch = out_ch
             res //= 2
 
-        self.features = nn.Sequential(*layers)
-        self.fc       = spectral_norm(nn.Linear(in_ch * res * res, 1))
-        self.act_out  = nn.Identity()
+        self.features  = nn.Sequential(*layers)
+        self.feat_dim  = in_ch * res * res
+        self.fc        = spectral_norm(nn.Linear(self.feat_dim, 1))
+        self.act_out   = nn.Identity()
+
+        if self.num_classes > 1:
+            self.proj = spectral_norm(nn.Embedding(self.num_classes, self.feat_dim))
+            nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
 
         self.apply(he_init)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.features(x)
-        return self.act_out(self.fc(h.flatten(1))).view(-1)
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
+        feats = self.features(x).flatten(1)
+        out = self.fc(feats).view(-1)
+        if self.num_classes > 1 and y is not None:
+            if y.dtype.is_floating_point:
+                # continuous mix over class embeddings (matches Generator's path)
+                if y.dim() == 1:
+                    e0 = self.proj.weight[0]
+                    e1 = self.proj.weight[1] if self.num_classes > 1 else e0
+                    emb = (1.0 - y).unsqueeze(-1) * e0 + y.unsqueeze(-1) * e1
+                else:
+                    emb = y.to(feats.dtype) @ self.proj.weight
+            else:
+                emb = self.proj(y.to(torch.long))
+            out = out + (feats * emb).sum(dim=-1)
+        return self.act_out(out)
 
 
 def build_cxr_g(z_dim=128, base_ch=64):

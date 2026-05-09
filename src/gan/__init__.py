@@ -14,14 +14,38 @@ from src.gan.loss import (
     HingeR1_DiscriminatorLoss,
 )
 
+
+def is_conditional(model) -> bool:
+    """True if the model exposes a class-conditional forward path."""
+    return int(getattr(model, "num_classes", 0) or 0) > 1
+
+
+def cond_forward(model, x, y=None):
+    """Call model(x, y) for conditional models, model(x) otherwise.
+
+    Lets us share train_disc / updater code across conditional and
+    unconditional architectures without sprinkling isinstance checks.
+    """
+    if is_conditional(model) and y is not None:
+        return model(x, y)
+    return model(x)
+
+
+def sample_labels(model, batch_size: int, device) -> "torch.Tensor | None":
+    """Sample uniform random class labels if ``model`` is conditional."""
+    import torch
+    if not is_conditional(model):
+        return None
+    return torch.randint(0, int(model.num_classes), (batch_size,), device=device)
+
 # ─────────────────────────────────── GAN factory ───────────────────────────────────
-def construct_gan(config, img_size, device):
+def construct_gan(config, img_size, device, num_classes: int = 0):
     loss_name = config["loss"]["name"].lower()
 
     # critic-like outputs (no sigmoid) for WGAN-GP and hinge losses
     is_critic = loss_name in {"wgan-gp", "hinge-r1", "ns"}
 
-    
+
     use_batch_norm = loss_name != "wgan-gp"
 
     arch = config["architecture"]
@@ -56,15 +80,18 @@ def construct_gan(config, img_size, device):
                  is_critic=is_critic).to(device)
 
     elif arch["name"] == "chest-xray":
-        # chest_xray architecture expects `fmap` (not `filter_dim`)
+        # chest_xray architecture expects `fmap` (not `filter_dim`) and
+        # supports class-conditional G + projection D when num_classes > 1.
         G = CXR_G(
             img_size=img_size,
             z_dim=config["z_dim"],
             fmap=arch["g_filter_dim"],
+            num_classes=num_classes,
         ).to(device)
         D = CXR_D(
             img_size=img_size,
             fmap=arch["d_filter_dim"],
+            num_classes=num_classes,
             is_critic=is_critic,
         ).to(device)
 

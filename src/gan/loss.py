@@ -22,7 +22,8 @@ class DiscriminatorLoss:
     def __init__(self, terms):
         self.terms = terms
 
-    def __call__(self, real_data, fake_data, real_output, fake_output, device):
+    def __call__(self, real_data, fake_data, real_output, fake_output, device,
+                 *, real_label=None, fake_label=None):
         raise NotImplementedError
 
     def get_loss_terms(self):
@@ -36,7 +37,8 @@ class NS_DiscriminatorLoss(DiscriminatorLoss):
         self.bce_logits = nn.BCEWithLogitsLoss()
         self.bce = nn.BCELoss()
 
-    def __call__(self, real_data, fake_data, real_output, fake_output, device):
+    def __call__(self, real_data, fake_data, real_output, fake_output, device,
+                 *, real_label=None, fake_label=None):
         ones  = torch.ones_like(real_output, dtype=torch.float, device=device)
         zeros = torch.zeros_like(fake_output, dtype=torch.float, device=device)
 
@@ -67,8 +69,9 @@ class WGP_DiscriminatorLoss(DiscriminatorLoss):
         self.D = D
         self.lmbda = lmbda
 
-    def calc_gradient_penalty(self, real_data, fake_data, device):
+    def calc_gradient_penalty(self, real_data, fake_data, device, label=None):
         # Run in fp32 — second-order gradients through autocast are unstable.
+        from src.gan import is_conditional
         with torch.autocast(device_type=device.type, enabled=False):
             real_f = real_data.detach().float()
             fake_f = fake_data.detach().float()
@@ -77,7 +80,10 @@ class WGP_DiscriminatorLoss(DiscriminatorLoss):
             interpolates = (real_f + alpha * (fake_f - real_f)).detach()
             interpolates.requires_grad_(True)
 
-            disc_interpolates = self.D(interpolates)
+            if is_conditional(self.D) and label is not None:
+                disc_interpolates = self.D(interpolates, label)
+            else:
+                disc_interpolates = self.D(interpolates)
             grad_outputs = torch.ones_like(disc_interpolates, device=device)
 
             gradients = autograd.grad(
@@ -89,12 +95,13 @@ class WGP_DiscriminatorLoss(DiscriminatorLoss):
             gradients_norm = gradients.view(batch_size, -1).norm(2, dim=1)
             return ((gradients_norm - 1.)**2).mean()
 
-    def __call__(self, real_data, fake_data, real_output, fake_output, device):
+    def __call__(self, real_data, fake_data, real_output, fake_output, device,
+                 *, real_label=None, fake_label=None):
         d_loss_real = -real_output.mean()
         d_loss_fake =  fake_output.mean()
         d_loss = d_loss_real + d_loss_fake
 
-        gp = self.calc_gradient_penalty(real_data, fake_data, device)
+        gp = self.calc_gradient_penalty(real_data, fake_data, device, label=real_label)
         w_distance = - d_loss_real - d_loss_fake
 
         return d_loss + self.lmbda * gp, {
@@ -109,11 +116,15 @@ class HingeR1_DiscriminatorLoss(DiscriminatorLoss):
         self.D = D
         self.r1_gamma = r1_gamma
 
-    def calc_r1(self, real_data, device):
+    def calc_r1(self, real_data, device, label=None):
         # Run in fp32 — second-order gradients through autocast are unstable.
+        from src.gan import is_conditional
         with torch.autocast(device_type=device.type, enabled=False):
             real_f = real_data.detach().float().requires_grad_(True)
-            real_logits = self.D(real_f)
+            if is_conditional(self.D) and label is not None:
+                real_logits = self.D(real_f, label)
+            else:
+                real_logits = self.D(real_f)
             grad_outputs = torch.ones_like(real_logits, device=device)
             grads = autograd.grad(
                 outputs=real_logits,
@@ -126,14 +137,15 @@ class HingeR1_DiscriminatorLoss(DiscriminatorLoss):
             grads = grads.view(grads.size(0), -1)
             return (grads.norm(2, dim=1) ** 2).mean()
 
-    def __call__(self, real_data, fake_data, real_output, fake_output, device):
+    def __call__(self, real_data, fake_data, real_output, fake_output, device,
+                 *, real_label=None, fake_label=None):
         # 1) Hinge loss
         loss_real = F.relu(1.0 - real_output).mean()
         loss_fake = F.relu(1.0 + fake_output).mean()
         d_loss = 0.5 * (loss_real + loss_fake)
 
         # 2) R1 penalty
-        r1 = self.calc_r1(real_data, device)
+        r1 = self.calc_r1(real_data, device, label=real_label)
         total = d_loss + 0.5 * self.r1_gamma * r1
 
         return total, {

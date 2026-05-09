@@ -24,6 +24,7 @@ config_schema = Schema({
         Optional("binary"): {"pos": int, "neg": int}
     },
     "model": {
+        Optional("num_classes"): int,
         "z_dim": int,
         "architecture": Or(
             {
@@ -111,6 +112,7 @@ config_schema = Schema({
             Optional("amp"): Or(str, bool, None),
             Optional("compile"): Or(str, bool, None),
             Optional("compile_d"): Or(str, bool, None),
+            Optional("diffaug"): Or(str, bool, None, {Optional("policy"): str}),
         }),
         "step-2": {
             Optional("step-1-epochs", default="best"): [Or(int, "best", "last")],
@@ -136,6 +138,7 @@ config_schema = Schema({
             Optional("amp"): Or(str, bool, None),
             Optional("compile"): Or(str, bool, None),
             Optional("compile_d"): Or(str, bool, None),
+            Optional("diffaug"): Or(str, bool, None, {Optional("policy"): str}),
             Optional("hpo-trials"): int,
             Optional("hpo-walltime"): int,
         }
